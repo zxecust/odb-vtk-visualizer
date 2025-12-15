@@ -1,0 +1,5 @@
+pandas
+numpy
+matplotlib
+pyqt5==5.15.9
+vtk==9.2.6

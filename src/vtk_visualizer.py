@@ -513,18 +513,15 @@ class VTKWindow(QtWidgets.QMainWindow):
         初始化或重置 VTK 网格数据结构。
         此函数仅处理模型数据，不应处理渲染器或背景设置。
         """
-        if self.coords is None or self.elements is None:
-            # 清除旧的 Actor，但不清除 Renderer
-            if hasattr(self, 'actor') and self.actor is not None:
-                self.renderer.RemoveActor(self.actor)
-                self.actor = None
-            self.vtk_widget.GetRenderWindow().Render()
-            return
-        
-        # 移除旧的 Actor (只移除模型，不移除图例)
+        # 统一移除旧的 Actor (如果存在)
         if hasattr(self, 'actor') and self.actor is not None:
             self.renderer.RemoveActor(self.actor)
             self.actor = None
+            
+        if self.coords is None or self.elements is None:
+            # 数据无效，渲染清除后的空窗口
+            self.vtk_widget.GetRenderWindow().Render()
+            return
 
         # Points
         points = vtk.vtkPoints()

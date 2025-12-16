@@ -15,6 +15,8 @@ from PyQt5 import QtWidgets, QtCore
 from PyQt5.QtWidgets import QFileDialog
 import vtk
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
+from vtkmodules.vtkRenderingCore import vtkWindowToImageFilter
+from vtkmodules.vtkIOImage import vtkPNGWriter
 
 # -------------------------
 # 定义读取数据函数
@@ -117,7 +119,7 @@ def read_field_csv(csv_path, node_count):
     return field_name, field_data, frame_labels
 
 # -------------------------
-# 自定义 QVTK Widget 解决中键问题
+# 自定义 QVTK Widget 
 # -------------------------
 class CustomQVTKWidget(QVTKRenderWindowInteractor):
     """
@@ -206,7 +208,6 @@ class VTKWindow(QtWidgets.QMainWindow):
         # 确保 VTK 窗口和背景在程序启动时就初始化 (修改: 在 _init_ui 之后调用)
         self._setup_vtk_renderer_and_interaction()
 
-
     # ---------------------
     # VTK 辅助函数
     # ---------------------
@@ -230,7 +231,7 @@ class VTKWindow(QtWidgets.QMainWindow):
         scalar_bar.SetLookupTable(self.lut)
         scalar_bar.SetNumberOfLabels(12)
         scalar_bar.SetLabelFormat("%.2e")
-        scalar_bar.SetMaximumWidthInPixels(120)
+        scalar_bar.SetMaximumWidthInPixels(300)
         scalar_bar.SetMaximumHeightInPixels(450)
         scalar_bar.SetPosition(0.02, 0.70)
         scalar_bar.SetWidth(0.10)
@@ -290,15 +291,26 @@ class VTKWindow(QtWidgets.QMainWindow):
 
         # 顶部菜单 
         menubar = self.menuBar() 
-        file_menu = menubar.addMenu("文件") 
+        # 加载文件菜单
+        file_menu_load = menubar.addMenu("加载文件") 
 
+        # 加载INP文件按钮
         open_inp = QtWidgets.QAction("加载INP文件", self) 
         open_inp.triggered.connect(self.open_inp_file) 
-        file_menu.addAction(open_inp)
+        file_menu_load.addAction(open_inp)
 
+        # 加载CSV文件按钮
         open_csv = QtWidgets.QAction("加载CSV文件", self) 
         open_csv.triggered.connect(self.open_csv_file)
-        file_menu.addAction(open_csv)
+        file_menu_load.addAction(open_csv)
+
+        # 导出文件菜单
+        file_menu_export = menubar.addMenu("导出文件")
+
+        # 导出图片按钮
+        export_img = QtWidgets.QAction("导出为图片", self) 
+        export_img.triggered.connect(self.export_image) 
+        file_menu_export.addAction(export_img)
 
         # 顶部控制条 (物理场选择)
         ctrl_layout_field_inner = QtWidgets.QHBoxLayout() 
@@ -504,6 +516,55 @@ class VTKWindow(QtWidgets.QMainWindow):
         else:
             self.set_playback_enabled(False)
 
+    # ---------------------
+    # 导出功能
+    # ---------------------
+    def export_image(self):
+        """导出当前 VTK 窗口中的帧为图片 (PNG)"""
+        if self.vtk_widget.GetRenderWindow() is None:
+            QtWidgets.QMessageBox.warning(self, "Warning", "VTK 渲染窗口尚未初始化！")
+            return
+            
+        # 弹出文件对话框选择保存路径
+        file_name, _ = QFileDialog.getSaveFileName(
+            self, 
+            "Save Current Frame Image", 
+            "current_frame.png", 
+            "PNG Image (*.png);;JPEG Image (*.jpg);;TIFF Image (*.tif)"
+        )
+
+        if file_name:
+            # 1. 创建 vtkWindowToImageFilter
+            w2i = vtkWindowToImageFilter()
+            w2i.SetInput(self.vtk_widget.GetRenderWindow())
+            # 设置 ReadFrontBufferOff 可以在渲染完成前进行截图
+            # ReadFrontBufferOn 截取屏幕上实际显示的内容
+            w2i.SetInputBufferTypeToRGB() 
+            w2i.ReadFrontBufferOn() # 捕获当前显示的内容
+            w2i.Update()
+
+            # 2. 选择合适的写入器 (基于文件后缀名)
+            if file_name.lower().endswith(('.png')):
+                writer = vtkPNGWriter()
+            elif file_name.lower().endswith(('.jpg', '.jpeg')):
+                from vtkmodules.vtkIOImage import vtkJPEGWriter
+                writer = vtkJPEGWriter()
+            elif file_name.lower().endswith(('.tif', '.tiff')):
+                from vtkmodules.vtkIOImage import vtkTIFFWriter
+                writer = vtkTIFFWriter()
+            else:
+                QtWidgets.QMessageBox.critical(self, "Error", "不支持的文件格式，请使用 .png, .jpg 或 .tif。")
+                return
+
+            # 3. 写入文件
+            writer.SetFileName(file_name)
+            writer.SetInputConnection(w2i.GetOutputPort())
+            
+            try:
+                writer.Write()
+                QtWidgets.QMessageBox.information(self, "Success", f"图片已成功保存到:\n{file_name}")
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Error", f"保存图片失败: {e}")
 
     # ---------------------
     # VTK 模型数据初始化 (修改)

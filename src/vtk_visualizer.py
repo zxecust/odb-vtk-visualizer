@@ -261,7 +261,7 @@ class VTKWindow(QtWidgets.QMainWindow):
     def _init_ui(self):
         # 初始化窗口
         self.setWindowTitle("VTK Visualizer")
-        self.resize(1800, 1350) 
+        self.resize(900, 900) 
 
         # 初始化中央部件和布局
         central = QtWidgets.QWidget() 

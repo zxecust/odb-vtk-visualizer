@@ -39,8 +39,7 @@ def odb_values(odbpath,step_num,var,var_choose):
     print("Current working directory: {}".format(original_dir)) 
 
     odb_dir = os.path.dirname(odbpath) # 获取ODB文件所在文件夹路径
-    odb_name = os.path.splitext(os.path.basename(odbpath))[0]  # 获取ODB文件名称（不含扩展名）
-    target_dir = os.path.join(odb_dir, "reports", odb_name, var) # 定义物理场数据输出文件夹路径
+    target_dir = os.path.join(odb_dir, "reports", var) # 定义物理场数据输出文件夹路径
     
     if not os.path.exists(target_dir): # 若输出文件夹不存在可创建
         os.makedirs(target_dir)

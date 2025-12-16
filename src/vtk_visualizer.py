@@ -242,9 +242,9 @@ class VTKWindow(QtWidgets.QMainWindow):
         # 交互器
         self.interactor = self.vtk_widget.GetRenderWindow().GetInteractor()
 
-        # 鼠标交互样式修改为 Unicam (中键旋转)
-        style = vtk.vtkInteractorStyleUnicam()
-        self.interactor.SetInteractorStyle(style)
+        # # 鼠标交互样式修改为 Unicam (中键旋转)
+        # style = vtk.vtkInteractorStyleUnicam()
+        # self.interactor.SetInteractorStyle(style)
         
         # 创建并添加 ScalarBar
         self.scalar_bar = self._create_scalar_bar()

@@ -14,37 +14,7 @@ import pandas as pd
 from PyQt5 import QtWidgets, QtCore
 from PyQt5.QtWidgets import QFileDialog
 import vtk
-from vtk.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
-
-# -------------------------
-# 自定义 QVTK Widget 解决中键问题 (新增)
-# -------------------------
-class CustomQVTKWidget(QVTKRenderWindowInteractor):
-    """
-    重写鼠标中键事件，确保在某些系统或 Qt 配置下，
-    鼠标中键按下和释放事件能够正确转发给 VTK 交互器，
-    从而支持 vtkInteractorStyleUnicam 的中键旋转。
-    """
-    def MiddleButtonPress(self):
-        """转发 Middle Button Down 事件给 VTK"""
-        self._Iren.MiddleButtonPressEvent()
-        
-    def MiddleButtonRelease(self):
-        """转发 Middle Button Up 事件给 VTK"""
-        self._Iren.MiddleButtonReleaseEvent()
-
-    def mousePressEvent(self, event):
-        if event.button() == QtCore.Qt.MiddleButton:
-            self.MiddleButtonPress()
-        else:
-            super().mousePressEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == QtCore.Qt.MiddleButton:
-            self.MiddleButtonRelease()
-        else:
-            super().mouseReleaseEvent(event)
-
+from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 
 # -------------------------
 # 定义读取数据函数
@@ -147,6 +117,57 @@ def read_field_csv(csv_path, node_count):
     return field_name, field_data, frame_labels
 
 # -------------------------
+# 自定义 QVTK Widget 解决中键问题
+# -------------------------
+class CustomQVTKWidget(QVTKRenderWindowInteractor):
+    """
+    重写鼠标中键事件，确保在某些系统或 Qt 配置下，
+    鼠标中键按下和释放事件能够正确转发给 VTK 交互器，
+    从而支持 vtkInteractorStyleTrackballCamera 的中键旋转/平移。
+    """
+    def MiddleButtonPress(self):
+        """转发 Middle Button Down 事件给 VTK"""
+        self._Iren.MiddleButtonPressEvent()
+        
+    def MiddleButtonRelease(self):
+        """转发 Middle Button Up 事件给 VTK"""
+        self._Iren.MiddleButtonReleaseEvent()
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.MiddleButton:
+            self.MiddleButtonPress()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event): # 添加 event 参数
+        if event.button() == QtCore.Qt.MiddleButton:
+            self.MiddleButtonRelease()
+        else:
+            super().mouseReleaseEvent(event)
+
+# -------------------------
+# 自定义交互样式
+# -------------------------
+class CustomInteractorStyle(vtk.vtkInteractorStyleTrackballCamera):
+    """
+    实现 Solidworks/ABAQUS 风格的交互：
+    - 滚轮滚动: 缩放 (重写 OnMouseWheelForward/Backward)
+    - 中键拖动: 旋转 (继承 TrackballCamera 的默认行为)
+    - 右键拖动: 平移 (继承 TrackballCamera 的默认行为)
+    """
+    def OnMouseWheelForward(self):
+        """滚轮向前滚动 (放大)"""
+        # 使用 vtkInteractorStyleTrackballCamera 的 ZoomOut 动作实现放大
+        self.ZoomOut() 
+        self.GetInteractor().Render()
+
+    def OnMouseWheelBackward(self):
+        """滚轮向后滚动 (缩小)"""
+        # 使用 vtkInteractorStyleTrackballCamera 的 ZoomIn 动作实现缩小
+        self.ZoomIn() 
+        self.GetInteractor().Render()
+
+# -------------------------
 # 定义主窗口
 # -------------------------
 class VTKWindow(QtWidgets.QMainWindow): 
@@ -242,9 +263,9 @@ class VTKWindow(QtWidgets.QMainWindow):
         # 交互器
         self.interactor = self.vtk_widget.GetRenderWindow().GetInteractor()
 
-        # # 鼠标交互样式修改为 Unicam (中键旋转)
-        # style = vtk.vtkInteractorStyleUnicam()
-        # self.interactor.SetInteractorStyle(style)
+        # 应用自定义的交互样式，实现滚轮缩放，中键旋转
+        custom_style = CustomInteractorStyle() 
+        self.interactor.SetInteractorStyle(custom_style)
         
         # 创建并添加 ScalarBar
         self.scalar_bar = self._create_scalar_bar()
@@ -267,7 +288,7 @@ class VTKWindow(QtWidgets.QMainWindow):
         central = QtWidgets.QWidget() 
         main_layout = QtWidgets.QVBoxLayout(central) 
 
-        # 顶部菜单 (省略)
+        # 顶部菜单 
         menubar = self.menuBar() 
         file_menu = menubar.addMenu("文件") 
 
@@ -280,45 +301,54 @@ class VTKWindow(QtWidgets.QMainWindow):
         file_menu.addAction(open_csv)
 
         # 顶部控制条 (物理场选择)
-        ctrl_layout_field = QtWidgets.QHBoxLayout() 
-        ctrl_layout_field.addWidget(QtWidgets.QLabel("物理场:")) 
+        ctrl_layout_field_inner = QtWidgets.QHBoxLayout() 
+        ctrl_layout_field_inner.addWidget(QtWidgets.QLabel("物理场:")) 
         self.field_combo = QtWidgets.QComboBox() 
         self.field_combo.currentTextChanged.connect(self.on_field_changed)
-        ctrl_layout_field.addWidget(self.field_combo) 
-        ctrl_layout_field.addStretch()
-        main_layout.addLayout(ctrl_layout_field)
-        
-        # 播放控制条
-        ctrl_layout_play = QtWidgets.QHBoxLayout()
-        
+        ctrl_layout_field_inner.addWidget(self.field_combo) 
+        self.field_selection_group = QtWidgets.QGroupBox("选择物理场") 
+        self.field_selection_group.setLayout(ctrl_layout_field_inner) 
+        self.field_selection_group.setFixedWidth(250) # 限制宽度，防止挤压播放控件
+
+        # 创建播放控制
+        ctrl_layout_play_inner = QtWidgets.QHBoxLayout() # 使用新的 inner 布局
+
         # 播放/暂停按钮
         self.play_btn = QtWidgets.QPushButton("▶ 播放")
         self.play_btn.clicked.connect(self.toggle_play_pause) 
-        ctrl_layout_play.addWidget(self.play_btn)
+        ctrl_layout_play_inner.addWidget(self.play_btn)
         
         # 循环模式复选框
         self.loop_checkbox = QtWidgets.QCheckBox("循环播放") 
         self.loop_checkbox.setChecked(self.loop_mode)
         self.loop_checkbox.stateChanged.connect(self.on_loop_changed)
-        ctrl_layout_play.addWidget(self.loop_checkbox)
+        ctrl_layout_play_inner.addWidget(self.loop_checkbox)
         
         # 倍速选择
-        ctrl_layout_play.addWidget(QtWidgets.QLabel("倍速:"))
+        ctrl_layout_play_inner.addWidget(QtWidgets.QLabel("倍速:"))
         self.speed_combo = QtWidgets.QComboBox()
         self.speed_combo.addItems(["0.25x", "0.5x", "1.0x", "2.0x", "4.0x"])
         self.speed_combo.setCurrentText("1.0x")
         self.speed_combo.currentTextChanged.connect(self.on_speed_changed)
-        ctrl_layout_play.addWidget(self.speed_combo)
+        ctrl_layout_play_inner.addWidget(self.speed_combo)
 
         # 当前帧标签
         self.frame_label = QtWidgets.QLabel("帧: 0 / 0")
-        ctrl_layout_play.addWidget(self.frame_label)
+        ctrl_layout_play_inner.addWidget(self.frame_label)
+        
+        self.control_group = QtWidgets.QGroupBox("控制播放") 
+        self.control_group.setLayout(ctrl_layout_play_inner) 
 
-        ctrl_layout_play.addStretch()
-        main_layout.addLayout(ctrl_layout_play)
+        # 将物理场选择和播放控制放在同一行
+        combined_control_layout = QtWidgets.QHBoxLayout()
+        combined_control_layout.addWidget(self.field_selection_group)
+        spacer = QtWidgets.QSpacerItem(20, 20, QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Minimum)
+        combined_control_layout.addItem(spacer)
+        combined_control_layout.addWidget(self.control_group)
+        main_layout.addLayout(combined_control_layout)
 
-        # VTK 窗口：使用 CustomQVTKWidget 修复中键问题 (修改)
-        self.vtk_widget = CustomQVTKWidget(central) 
+        # VTK 窗口
+        self.vtk_widget = CustomQVTKWidget(central)  
         main_layout.addWidget(self.vtk_widget)
 
         # 滑块

@@ -4,7 +4,7 @@
 
 ## 项目结构
 
-```
+```bash
 vtk-visualizer/
 ├── data/              # 物理场数据（.csv）
 ├── model/             # 有限元模型（.inp）
@@ -36,4 +36,6 @@ pip install -r requirements.txt
 
 ### 软件运行
 
-运行`/src/vtk_visualizer.py`，在主界面依次选择“文件-加载INP文件”和“文件-加载CSV文件”，即可显示物理场云图。可以通过滑块手动选择播放帧或循环播放物理场云图演变过程。
+运行`/src/vtk_visualizer.py`，在主界面依次选择“加载文件-加载INP文件”和“加载文件-加载CSV文件”，即可显示物理场云图。可以通过滑块手动选择播放帧或循环播放物理场云图演变过程。
+
+![UI界面](pic\ui.png)

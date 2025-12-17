@@ -85,7 +85,7 @@ def odb_values(odbpath,step_num,var,var_choose):
                 odb=odb,
                 step=step_index,
                 frame=frame_num,
-                outputPosition=NODAL,
+                outputPosition=NODAL, # 节点位置
                 variable=variable_tuple
             )
 
@@ -110,9 +110,9 @@ def odb_values(odbpath,step_num,var,var_choose):
     print("- " * 80) # 打印分割线，分隔两次函数调用
 
 # 主程序入口
-odbpath = 'C:/Users/zx_ec/Documents/ABAQUS/model/Steam_Turbine_Rotor/ST-01-100-V2/ST-01-100-V2.odb'  # 该模型分析步数为1
-# odbpath = 'C:/Users/zx_ec/Documents/ABAQUS/model/Engine_Turbine_Disk/M12-4h/M12-4h.odb'  # 该模型分析步数为3
-step_num = 1 # 分析步总数，此处的数值和ABAQUS中Step数量应该一致
+# odbpath = 'C:/Users/zx_ec/Documents/ABAQUS/model/Steam_Turbine_Rotor/ST-01-100-V2/ST-01-100-V2.odb'  # 该模型分析步数为1
+odbpath = 'C:/Users/zx_ec/Documents/ABAQUS/model/Engine_Turbine_Disk/M12-4h/M12-4h.odb'  # 该模型分析步数为3
+step_num = 3 # 分析步总数，此处的数值和ABAQUS中Step数量应该一致
 
 # 定义需要导出的物理场变量及其选项的列表
 export_tasks = [

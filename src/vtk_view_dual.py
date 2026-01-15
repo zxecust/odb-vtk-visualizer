@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 from PyQt5 import QtWidgets, QtCore
 from PyQt5.QtWidgets import QFileDialog
+from PyQt5.QtGui import QIcon
 import vtk
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 
@@ -122,6 +123,17 @@ def create_abaqus_lut():
     ]
     for i, rgb in enumerate(abaqus_colors): # 设置 LUT 颜色
         lut.SetTableValue(i, rgb[0], rgb[1], rgb[2], 1.0)
+    return lut
+
+def create_rainbow_lut(num_colors: int = 256):
+    """创建 rainbow（HSV）渐变 LUT（深蓝->红色）。"""
+    lut = vtk.vtkLookupTable()
+    lut.SetNumberOfTableValues(num_colors)
+    # 通过 HSV HueRange 生成类似 JET 的彩虹渐变
+    lut.SetHueRange(0.667, 0.0)  # blue -> red
+    lut.SetSaturationRange(1.0, 1.0)
+    lut.SetValueRange(1.0, 1.0)
+    lut.Build()
     return lut
 
 def build_unstructured_grid(node_ids: np.ndarray, coords: np.ndarray, elements: list):
@@ -286,8 +298,11 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         self._closing = False # 关闭阶段标记：用于阻止渲染/回调
 
         # VTK objects
-        self.lut_left = create_abaqus_lut() # 左侧独立 LUT
-        self.lut_right = create_abaqus_lut()  # 右侧独立 LUT
+        self.lut_left = create_rainbow_lut() # 左侧独立 LUT
+        self.lut_right = create_rainbow_lut()  # 右侧独立 LUT
+
+        self.background_style = "abaqus"
+        self.colormap_style = "rainbow"
 
         self._init_ui() # 初始化 UI
         self._init_vtk() # 初始化 VTK 渲染
@@ -320,6 +335,9 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
     def _init_ui(self):
         """构建主界面 UI。"""
         self.setWindowTitle("Vtk Visualizer")
+        icon_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "assets", "logo.ico"))
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
         self.resize(1650, 950)
 
         central = QtWidgets.QWidget()
@@ -343,6 +361,46 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         act_rom = QtWidgets.QAction("加载CSV文件（ROM）", self)
         act_rom.triggered.connect(self.open_csv_right)
         menu_load.addAction(act_rom)
+
+        menu_vis = menubar.addMenu("可视化")
+
+        menu_bg = menu_vis.addMenu("背景设置")
+        self.bg_group = QtWidgets.QActionGroup(self)
+        self.bg_group.setExclusive(True)
+
+        act_bg_abaqus = QtWidgets.QAction("abaqus", self)
+        act_bg_abaqus.setCheckable(True)
+        act_bg_abaqus.setChecked(self.background_style == "abaqus")
+        act_bg_abaqus.triggered.connect(lambda: self.set_background_style("abaqus"))
+
+        act_bg_white = QtWidgets.QAction("white", self)
+        act_bg_white.setCheckable(True)
+        act_bg_white.setChecked(self.background_style == "white")
+        act_bg_white.triggered.connect(lambda: self.set_background_style("white"))
+
+        self.bg_group.addAction(act_bg_abaqus)
+        self.bg_group.addAction(act_bg_white)
+        menu_bg.addAction(act_bg_abaqus)
+        menu_bg.addAction(act_bg_white)
+
+        menu_lut = menu_vis.addMenu("颜色映射")
+        self.lut_group = QtWidgets.QActionGroup(self)
+        self.lut_group.setExclusive(True)
+
+        act_lut_abaqus = QtWidgets.QAction("abaqus", self)
+        act_lut_abaqus.setCheckable(True)
+        act_lut_abaqus.setChecked(self.colormap_style == "abaqus")
+        act_lut_abaqus.triggered.connect(lambda: self.set_colormap_style("abaqus"))
+
+        act_lut_grad = QtWidgets.QAction("rainbow", self)
+        act_lut_grad.setCheckable(True)
+        act_lut_grad.setChecked(self.colormap_style == "rainbow")
+        act_lut_grad.triggered.connect(lambda: self.set_colormap_style("rainbow"))
+
+        self.lut_group.addAction(act_lut_abaqus)
+        self.lut_group.addAction(act_lut_grad)
+        menu_lut.addAction(act_lut_abaqus)
+        menu_lut.addAction(act_lut_grad)
 
         # 控制条
         ctrl_widget = QtWidgets.QWidget()
@@ -424,6 +482,67 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         self.speed_combo.setEnabled(enabled)
         self.slider.setEnabled(enabled)
 
+    def set_background_style(self, style: str):
+        """切换视窗背景风格并重新渲染。"""
+        if not style:
+            return
+        style = style.strip().lower()
+        if style not in ("abaqus", "white"):
+            return
+        self.background_style = style
+        self._apply_background_style(style)
+
+    def _apply_background_style(self, style: str):
+        if not hasattr(self, "ren_l") or not hasattr(self, "ren_r"):
+            return
+        if style == "abaqus":
+            self._set_abaqus_background(self.ren_l)
+            self._set_abaqus_background(self.ren_r)
+        elif style == "white":
+            self._set_white_background(self.ren_l)
+            self._set_white_background(self.ren_r)
+        self.safe_render_both()
+
+    def _set_abaqus_background(self, renderer):
+        renderer.GradientBackgroundOn()
+        renderer.SetBackground2(27/255.0, 45/255.0, 70/255.0)
+        renderer.SetBackground(158/255.0, 173/255.0, 194/255.0)
+
+    def _set_white_background(self, renderer):
+        renderer.GradientBackgroundOff()
+        renderer.SetBackground(1.0, 1.0, 1.0)
+        renderer.SetBackground2(1.0, 1.0, 1.0)
+
+    def set_colormap_style(self, style: str):
+        """切换颜色映射并同步左右 LUT。"""
+        if not style:
+            return
+        style = style.strip().lower()
+        if style not in ("abaqus", "rainbow"):
+            return
+        self.colormap_style = style
+        self._apply_colormap_style(style)
+
+    def _apply_colormap_style(self, style: str):
+        if style == "abaqus":
+            new_lut = create_abaqus_lut()
+        else:
+            new_lut = create_rainbow_lut()
+
+        self.lut_left.DeepCopy(new_lut)
+        self.lut_right.DeepCopy(new_lut)
+
+        if hasattr(self, "mapper_l"):
+            self.mapper_l.SetLookupTable(self.lut_left)
+        if hasattr(self, "mapper_r"):
+            self.mapper_r.SetLookupTable(self.lut_right)
+        if hasattr(self, "scalarbar_l"):
+            self.scalarbar_l.SetLookupTable(self.lut_left)
+        if hasattr(self, "scalarbar_r"):
+            self.scalarbar_r.SetLookupTable(self.lut_right)
+
+        self.safe_render_both()
+
     # -------------------------
     # VTK 初始化
     # -------------------------
@@ -431,17 +550,12 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         """初始化 VTK 渲染器和交互器，并设置视角同步。"""
         # 左 renderer
         self.ren_l = vtk.vtkRenderer()
-        self.ren_l.GradientBackgroundOn()
-        self.ren_l.SetBackground2(27/255.0, 45/255.0, 70/255.0)
-        self.ren_l.SetBackground(158/255.0, 173/255.0, 194/255.0)
         self.vtk_left.GetRenderWindow().AddRenderer(self.ren_l)
 
         # 右 renderer
         self.ren_r = vtk.vtkRenderer()
-        self.ren_r.GradientBackgroundOn()
-        self.ren_r.SetBackground2(27/255.0, 45/255.0, 70/255.0)
-        self.ren_r.SetBackground(158/255.0, 173/255.0, 194/255.0)
         self.vtk_right.GetRenderWindow().AddRenderer(self.ren_r)
+        self._apply_background_style(self.background_style)
 
         # 视角同步：共享同一个 vtkCamera
         shared_cam = self.ren_l.GetActiveCamera()

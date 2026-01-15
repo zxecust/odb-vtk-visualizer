@@ -9,10 +9,12 @@ VTK 可视化器:
 """
 
 import sys
+import os
 import numpy as np
 import pandas as pd
 from PyQt5 import QtWidgets, QtCore
 from PyQt5.QtWidgets import QFileDialog
+from PyQt5.QtGui import QIcon
 import vtk
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 from vtkmodules.vtkRenderingCore import vtkWindowToImageFilter
@@ -192,7 +194,9 @@ class VTKWindow(QtWidgets.QMainWindow):
         self.ugrid = None
         self.actor = None
         self.mapper = None
-        self.lut = self._create_abaqus_lut() # 提前创建 LUT
+        self.background_style = "abaqus"
+        self.colormap_style = "rainbow"
+        self.lut = self._create_rainbow_lut() # 提前创建 LUT
         self.scalar_bar = None
         
         # 初始化动画控制变量
@@ -224,6 +228,16 @@ class VTKWindow(QtWidgets.QMainWindow):
         for i, rgb in enumerate(abaqus_colors):
             lut.SetTableValue(i, *rgb, 1.0)
         return lut
+
+    def _create_rainbow_lut(self, num_colors=256):
+        """创建 Rainbow（HSV）渐变颜色查找表"""
+        lut = vtk.vtkLookupTable()
+        lut.SetNumberOfTableValues(num_colors)
+        lut.SetHueRange(0.667, 0.0)  # blue -> red
+        lut.SetSaturationRange(1.0, 1.0)
+        lut.SetValueRange(1.0, 1.0)
+        lut.Build()
+        return lut
         
     def _create_scalar_bar(self):
         """创建颜色图例 Actor"""
@@ -243,6 +257,61 @@ class VTKWindow(QtWidgets.QMainWindow):
         title_text.SetFontSize(10) # 保持和原代码一致
         title_text.BoldOn()
         return scalar_bar
+
+    def set_background_style(self, style):
+        """切换视窗背景风格并重新渲染。"""
+        if not style:
+            return
+        style = style.strip().lower()
+        if style not in ("abaqus", "white"):
+            return
+        self.background_style = style
+        self._apply_background_style(style)
+
+    def _apply_background_style(self, style):
+        if self.renderer is None:
+            return
+        if style == "abaqus":
+            self._set_abaqus_background(self.renderer)
+        elif style == "white":
+            self._set_white_background(self.renderer)
+        self.vtk_widget.GetRenderWindow().Render()
+
+    def _set_abaqus_background(self, renderer):
+        renderer.GradientBackgroundOn()
+        renderer.SetBackground2(27/255, 45/255, 70/255)
+        renderer.SetBackground(158/255, 173/255, 194/255)
+
+    def _set_white_background(self, renderer):
+        renderer.GradientBackgroundOff()
+        renderer.SetBackground(1.0, 1.0, 1.0)
+        renderer.SetBackground2(1.0, 1.0, 1.0)
+
+    def set_colormap_style(self, style):
+        """切换颜色映射并更新 LUT。"""
+        if not style:
+            return
+        style = style.strip().lower()
+        if style not in ("abaqus", "rainbow"):
+            return
+        self.colormap_style = style
+        self._apply_colormap_style(style)
+
+    def _apply_colormap_style(self, style):
+        if style == "abaqus":
+            new_lut = self._create_abaqus_lut()
+        else:
+            new_lut = self._create_rainbow_lut()
+
+        self.lut.DeepCopy(new_lut)
+
+        if self.mapper is not None:
+            self.mapper.SetLookupTable(self.lut)
+        if self.scalar_bar is not None:
+            self.scalar_bar.SetLookupTable(self.lut)
+
+        if self.vtk_widget.GetRenderWindow() is not None:
+            self.vtk_widget.GetRenderWindow().Render()
         
     def _setup_vtk_renderer_and_interaction(self):
         """
@@ -255,11 +324,8 @@ class VTKWindow(QtWidgets.QMainWindow):
 
         # 渲染器
         self.renderer = vtk.vtkRenderer()
-        self.renderer.GradientBackgroundOn()
-        # Abaqus 风格背景色设置 (保持和原代码一致)
-        self.renderer.SetBackground2(27/255, 45/255, 70/255)
-        self.renderer.SetBackground(158/255, 173/255, 194/255)
         self.vtk_widget.GetRenderWindow().AddRenderer(self.renderer)
+        self._apply_background_style(self.background_style)
         
         # 交互器
         self.interactor = self.vtk_widget.GetRenderWindow().GetInteractor()
@@ -270,7 +336,7 @@ class VTKWindow(QtWidgets.QMainWindow):
         
         # 创建并添加 ScalarBar
         self.scalar_bar = self._create_scalar_bar()
-        self.renderer.AddActor2D(self.scalar_bar) 
+        self.renderer.AddViewProp(self.scalar_bar) 
         
         # 首次渲染和交互器初始化
         self.renderer.ResetCamera()
@@ -283,6 +349,9 @@ class VTKWindow(QtWidgets.QMainWindow):
     def _init_ui(self):
         # 初始化窗口
         self.setWindowTitle("VTK Visualizer")
+        icon_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "assets", "logo.ico"))
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
         self.resize(900, 900) 
 
         # 初始化中央部件和布局
@@ -311,6 +380,46 @@ class VTKWindow(QtWidgets.QMainWindow):
         export_img = QtWidgets.QAction("导出为图片", self) 
         export_img.triggered.connect(self.export_image) 
         file_menu_export.addAction(export_img)
+
+        # 可视化菜单
+        menu_vis = menubar.addMenu("可视化")
+        menu_bg = menu_vis.addMenu("背景设置")
+        self.bg_group = QtWidgets.QActionGroup(self)
+        self.bg_group.setExclusive(True)
+
+        act_bg_abaqus = QtWidgets.QAction("abaqus", self)
+        act_bg_abaqus.setCheckable(True)
+        act_bg_abaqus.setChecked(self.background_style == "abaqus")
+        act_bg_abaqus.triggered.connect(lambda: self.set_background_style("abaqus"))
+
+        act_bg_white = QtWidgets.QAction("white", self)
+        act_bg_white.setCheckable(True)
+        act_bg_white.setChecked(self.background_style == "white")
+        act_bg_white.triggered.connect(lambda: self.set_background_style("white"))
+
+        self.bg_group.addAction(act_bg_abaqus)
+        self.bg_group.addAction(act_bg_white)
+        menu_bg.addAction(act_bg_abaqus)
+        menu_bg.addAction(act_bg_white)
+
+        menu_lut = menu_vis.addMenu("颜色映射")
+        self.lut_group = QtWidgets.QActionGroup(self)
+        self.lut_group.setExclusive(True)
+
+        act_lut_abaqus = QtWidgets.QAction("abaqus", self)
+        act_lut_abaqus.setCheckable(True)
+        act_lut_abaqus.setChecked(self.colormap_style == "abaqus")
+        act_lut_abaqus.triggered.connect(lambda: self.set_colormap_style("abaqus"))
+
+        act_lut_rainbow = QtWidgets.QAction("Rainbow", self)
+        act_lut_rainbow.setCheckable(True)
+        act_lut_rainbow.setChecked(self.colormap_style == "rainbow")
+        act_lut_rainbow.triggered.connect(lambda: self.set_colormap_style("rainbow"))
+
+        self.lut_group.addAction(act_lut_abaqus)
+        self.lut_group.addAction(act_lut_rainbow)
+        menu_lut.addAction(act_lut_abaqus)
+        menu_lut.addAction(act_lut_rainbow)
 
         # 顶部控制条 (物理场选择)
         ctrl_layout_field_inner = QtWidgets.QHBoxLayout() 

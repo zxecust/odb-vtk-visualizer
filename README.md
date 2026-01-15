@@ -32,7 +32,7 @@ pip install -r requirements.txt
 
 1. 若运行`/script/odb-output-csv.py`会将所选模型的`.odb`文件的数据导出为`.csv`文件，文件第一行为节点编号，第一列为帧索引，其余部分为节点数据；
 
-2. 若运行`/script/odb-output-rpt.py`会将所选模型的`.odb`文件的数据导出到相应文件夹，每一帧数据保存为一个`.rpt`文件，此时需要再次运行`/src/com_physical_filed_matrix`（文件中的`field_data_folder`、`output_file`、`variable_column`三个变量需要设置正确）将所选文件夹下所有的`.rpt`文件合成为`.csv`文件，文件第一行为节点编号，第一列为帧索引，其余部分为节点数据。
+2. 若运行`/script/odb-output-rpt.py`会将所选模型的`.odb`文件的数据导出到相应文件夹，每一帧数据保存为一个`.rpt`文件，此时需要再次运行`/script/com_physical_filed_matrix`（文件中的`field_data_folder`、`output_file`、`variable_column`三个变量需要设置正确）将所选文件夹下所有的`.rpt`文件合成为`.csv`文件，文件第一行为节点编号，第一列为帧索引，其余部分为节点数据。
 
 ### 软件运行
 

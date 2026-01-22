@@ -56,36 +56,48 @@ def read_inp_nodes(inp_path):
                         continue
     return np.array(node_ids), np.array(coords)
 
+def _parse_element_type(line: str):
+    parts = [p.strip() for p in line.split(",")]
+    for p in parts:
+        if p.lower().startswith("type="):
+            return p.split("=", 1)[1].strip().upper()
+    return None
+
+
 def read_inp_elements(inp_path):
     """
-    读取.inp文件，返回单元的节点连接信息列表
-    
-    :param inp_path: .inp 文件路径
-    :return: elements (list of list of int)
+    Read element connectivity from .inp and keep element type.
+
+    :param inp_path: .inp path
+    :return: list of (nodes, elem_type)
     """
-    elements = [] # 存储单元的节点连接信息
-    read_flag = False # 读取状态标志，默认关闭
+    elements = []
+    read_flag = False
+    elem_type = None
 
     with open(inp_path, 'r', encoding='utf-8', errors='ignore') as f:
         for line in f:
-            line = line.strip() # 去除行首尾空白
-            if not line: # 跳过空行 
+            line = line.strip()
+            if not line or line.startswith('**'):
                 continue
-            if line.lower().startswith('*element'): # 搜索关键字'*element'
-                read_flag = True
+            if line.startswith('*'):
+                if line.lower().startswith('*element'):
+                    read_flag = True
+                    elem_type = _parse_element_type(line)
+                else:
+                    read_flag = False
+                    elem_type = None
                 continue
-            if read_flag and line.startswith('*'): # 遇到下一个关键字停止读取
-                break
-            if read_flag: # 读取状态下，解析单元行
-                parts = [p.strip() for p in line.split(',')] # 分割并去除空白
-                # 检查 parts 是否有足够的元素
+            if read_flag:
+                parts = [p.strip() for p in line.split(',')]
                 if len(parts) > 1:
                     try:
-                        node_ids = [int(pid) for pid in parts[1:]]
-                        elements.append(node_ids)
-                    except ValueError: # 忽略格式不正确的行
+                        nodes = [int(pid) for pid in parts[1:]]
+                    except ValueError:
                         continue
+                    elements.append((nodes, elem_type))
     return elements
+
 
 def read_field_csv(csv_path, node_count):
     """
@@ -119,6 +131,39 @@ def read_field_csv(csv_path, node_count):
     import os
     field_name = os.path.splitext(os.path.basename(csv_path))[0] # 去除路径和扩展名的文件名作为变量字段名
     return field_name, field_data, frame_labels
+
+def _unpack_element(elem):
+    if isinstance(elem, dict):
+        return elem.get("nodes", []), elem.get("type")
+    if isinstance(elem, (list, tuple)):
+        if len(elem) == 2 and isinstance(elem[0], (list, tuple)) and not isinstance(elem[1], (int, np.integer)):
+            return list(elem[0]), elem[1]
+        return list(elem), None
+    return [], None
+
+
+def _select_cell(elem_type, n):
+    et = (elem_type or "").upper()
+    if et:
+        if et.startswith("C3D4"):
+            return vtk.vtkTetra()
+        if et.startswith("C3D8"):
+            return vtk.vtkHexahedron()
+        if et.startswith("C3D6"):
+            return vtk.vtkWedge()
+        if et.startswith(("CPS4", "CPE4", "S4", "CAX4")):
+            return vtk.vtkQuad()
+        if et.startswith(("CPS3", "CPE3", "S3", "CAX3")):
+            return vtk.vtkTriangle()
+    if n == 4:
+        return vtk.vtkQuad()
+    if n == 8:
+        return vtk.vtkHexahedron()
+    if n == 3:
+        return vtk.vtkTriangle()
+    if n == 6:
+        return vtk.vtkWedge()
+    return None
 
 # -------------------------
 # 自定义 QVTK Widget 
@@ -708,24 +753,18 @@ class VTKWindow(QtWidgets.QMainWindow):
 
         # Cells
         for elem in self.elements:
-            cell = None
-            if len(elem) == 4:
-                cell = vtk.vtkQuad()
-            elif len(elem) == 8:
-                cell = vtk.vtkHexahedron()
-            elif len(elem) == 3: 
-                cell = vtk.vtkTriangle()
-            elif len(elem) == 6: 
-                cell = vtk.vtkWedge()
-            if cell is not None:
-                try:
-                    for i, nid in enumerate(elem):
-                        cell.GetPointIds().SetId(i, self.node_id_map[nid])
-                    self.ugrid.InsertNextCell(cell.GetCellType(), cell.GetPointIds())
-                except KeyError:
-                    # 忽略单元中包含未在 *Node 中定义的节点ID
-                    print(f"Warning: Element skipped due to missing node ID(s).")
-                    continue
+            nodes, elem_type = _unpack_element(elem)
+            cell = _select_cell(elem_type, len(nodes))
+            if cell is None:
+                continue
+            try:
+                for i, nid in enumerate(nodes):
+                    cell.GetPointIds().SetId(i, self.node_id_map[nid])
+                self.ugrid.InsertNextCell(cell.GetCellType(), cell.GetPointIds())
+            except KeyError:
+                # Ignore elements containing undefined node ids
+                print(f"Warning: Element skipped due to missing node ID(s).")
+                continue
 
         # Mapper / Actor
         self.mapper = vtk.vtkDataSetMapper()

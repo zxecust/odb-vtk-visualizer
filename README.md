@@ -1,24 +1,22 @@
 # odb-vtk-visualizer
 
-本项目基于pyqt和vtk实现通过读取ABAQUS输入文件（.inp）和物理场文件（.csv）可视化物理场云图。
+基于 PyQt5 + VTK 的 Abaqus 物理场可视化工具。通过读取 Abaqus 输入文件（`.inp`）以及导出的物理场数据（`.csv`），实现物理场云图显示和动画播放。
 
 ## 项目结构
 
-```bash
-vtk-visualizer/
-├── data/              # 物理场数据（.csv）
-├── model/             # 有限元模型（.inp）
-├── script/            # ABAQUS python脚本
-├── src/               # 程序源代码
-├── pic/               # 输出图像
-└── README.md
+```text
+odb-vtk-visualizer/
+├─ assets/                        # 资源文件
+├─ script/                        # Abaqus/ODB 数据导出脚本
+├─ src/                           # 可视化程序
+├─ requirements.txt
+└─ README.md
 ```
 
 ## 环境依赖
 
-python版本：3.12.9
-
-请确保安装以下模块：
+- Python 3.x
+- 安装依赖：
 
 ```bash
 pip install -r requirements.txt
@@ -28,22 +26,22 @@ pip install -r requirements.txt
 
 ### 数据准备
 
-启动ABAQUS CAE，选择File-Run Script，选中`/script/odb-output-csv.py`或`/script/odb-output-rpt.py`并运行（脚本文件中的`odbpath`、`var`、`varchoose`三个变量需要设置正确）。
+在 Abaqus/CAE 中执行脚本（File -> Run Script）：
 
-1. 若运行`/script/odb-output-csv.py`会将所选模型的`.odb`文件的数据导出为`.csv`文件，文件第一行为节点编号，第一列为帧索引，其余部分为节点数据；
+- `script/odb_output_csv.py`：直接从 `.odb` 导出 `.csv`。
+- `script/odb_output_rpt.py`：导出每一帧 `.rpt`，再用 `script/com_physical_field_matrix.py` 合并为 `.csv`。
 
-2. 若运行`/script/odb-output-rpt.py`会将所选模型的`.odb`文件的数据导出到相应文件夹，每一帧数据保存为一个`.rpt`文件，此时需要再次运行`/script/com_physical_filed_matrix`（文件中的`field_data_folder`、`output_file`、`variable_column`三个变量需要设置正确）将所选文件夹下所有的`.rpt`文件合成为`.csv`文件，文件第一行为节点编号，第一列为帧索引，其余部分为节点数据。
+脚本里的 `odbpath` / `var` / `var_choose` 等参数需要按实际模型配置。
 
-### 软件运行
+### 运行可视化
 
-#### 单视窗版本 Version 1.0
+- 单视窗：`python src/vtk_view.py`
+  - 按界面提示加载 `.inp` 和 `.csv`。
+- 双视窗：`python src/vtk_view_dual.py`
+  - 依次加载 `.inp`、FOM `.csv`、ROM `.csv`。
 
-运行`/src/vtk_visualizer.py`，在主界面依次选择“加载文件-加载INP文件”和“加载文件-加载CSV文件”，即可显示物理场云图。可以通过滑块手动选择播放帧或循环播放物理场云图演变过程。
+软件运行效果如下图所示：
 
-#### 双视窗版本 Version 2.0
+  ![软件界面1](/assets/example1.png)
 
-运行`/src/vtk_fom_rom_visualizer.py`，在主界面依次选择“加载文件-加载INP文件”，“加载文件-加载CSV文件（FOM）”和“加载文件-加载CSV文件（ROM）”，即可在两侧分别显示不同的物理场数据云图。
-
-- 同样可以通过滑块手动选择播放帧或循环播放物理场云图演变过程，支持两视窗同步相机视角和颜色图例，方便对照。
-- 此程序的本意是用于同时显示全阶模型和降阶模型在同一帧的物理场云图，用于对比分析。
-- 如果两个 `.csv`文件同属于一个`.inp`文件，并且帧数相同（相同模型不同条件下的物理场演变数据），也可以用该程序同步显示对比。
+  ![软件界面2](/assets/example2.png)

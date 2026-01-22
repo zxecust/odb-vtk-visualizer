@@ -42,6 +42,4 @@ pip install -r requirements.txt
 
 软件运行效果如下图所示：
 
-  ![软件界面1](/assets/example1.png)
-
   ![软件界面2](/assets/example2.png)

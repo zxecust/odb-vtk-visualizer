@@ -51,29 +51,43 @@ def read_inp_nodes(inp_path: str):
                     continue
     return np.array(node_ids), np.array(coords)
 
+def _parse_element_type(line: str):
+    parts = [p.strip() for p in line.split(",")]
+    for p in parts:
+        if p.lower().startswith("type="):
+            return p.split("=", 1)[1].strip().upper()
+    return None
+
+
 def read_inp_elements(inp_path: str):
-    """读取 INP 文件中的单元信息，返回单元节点编号列表。"""
+    """Read element connectivity from INP. Returns (nodes, elem_type) list."""
     elements = []
     read_flag = False
+    elem_type = None
     with open(inp_path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
-            line = line.strip() # 去除首尾空白
-            if not line:
+            line = line.strip()
+            if not line or line.startswith("**"):
                 continue
-            if line.lower().startswith("*element"): # 识别*Element关键字
-                read_flag = True
+            if line.startswith("*"):
+                if line.lower().startswith("*element"):
+                    read_flag = True
+                    elem_type = _parse_element_type(line)
+                else:
+                    read_flag = False
+                    elem_type = None
                 continue
-            if read_flag and line.startswith("*"): # 遇到下一个*关键字则停止读取单元
-                break
             if read_flag:
-                parts = [p.strip() for p in line.split(",")] # 以逗号分割
-                if len(parts) < 2: # 单元至少应有编号和一个节点
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) < 2:
                     continue
                 try:
-                    elements.append([int(x) for x in parts[1:]]) # 单元节点编号
+                    nodes = [int(x) for x in parts[1:]]
                 except ValueError:
                     continue
+                elements.append((nodes, elem_type))
     return elements
+
 
 def read_field_csv(csv_path: str, node_count: int):
     """读取物理场 CSV 文件，返回字段名、数据数组和帧标签。"""
@@ -136,6 +150,40 @@ def create_rainbow_lut(num_colors: int = 256):
     lut.Build()
     return lut
 
+def _unpack_element(elem):
+    if isinstance(elem, dict):
+        return elem.get("nodes", []), elem.get("type")
+    if isinstance(elem, (list, tuple)):
+        if len(elem) == 2 and isinstance(elem[0], (list, tuple)) and not isinstance(elem[1], (int, np.integer)):
+            return list(elem[0]), elem[1]
+        return list(elem), None
+    return [], None
+
+
+def _select_cell(elem_type, n):
+    et = (elem_type or "").upper()
+    if et:
+        if et.startswith("C3D4"):
+            return vtk.vtkTetra()
+        if et.startswith("C3D8"):
+            return vtk.vtkHexahedron()
+        if et.startswith("C3D6"):
+            return vtk.vtkWedge()
+        if et.startswith(("CPS4", "CPE4", "S4", "CAX4")):
+            return vtk.vtkQuad()
+        if et.startswith(("CPS3", "CPE3", "S3", "CAX3")):
+            return vtk.vtkTriangle()
+    if n == 4:
+        return vtk.vtkQuad()
+    if n == 8:
+        return vtk.vtkHexahedron()
+    if n == 3:
+        return vtk.vtkTriangle()
+    if n == 6:
+        return vtk.vtkWedge()
+    return None
+
+
 def build_unstructured_grid(node_ids: np.ndarray, coords: np.ndarray, elements: list):
     """根据节点和单元信息构建 VTK 非结构化网格。"""
     points = vtk.vtkPoints() # 创建 vtkPoints 对象
@@ -151,29 +199,22 @@ def build_unstructured_grid(node_ids: np.ndarray, coords: np.ndarray, elements: 
     id_map = {nid: i for i, nid in enumerate(node_ids)}
 
     for elem in elements:
-        n = len(elem)
-        cell = None
-        # 根据节点数选择单元类型
-        if n == 4: 
-            cell = vtk.vtkQuad()
-        elif n == 8:
-            cell = vtk.vtkHexahedron()
-        elif n == 3:
-            cell = vtk.vtkTriangle()
-        elif n == 6:
-            cell = vtk.vtkWedge()
-        else:
+        nodes, elem_type = _unpack_element(elem)
+        n = len(nodes)
+        cell = _select_cell(elem_type, n)
+        if cell is None:
             continue
 
-        # 将ABAQUS的一个单元转化为VTK网格里的一个cell
+        # Abaqus element -> VTK cell
         try:
-            for i, nid in enumerate(elem):
+            for i, nid in enumerate(nodes):
                 cell.GetPointIds().SetId(i, id_map[nid])
-            grid.InsertNextCell(cell.GetCellType(), cell.GetPointIds()) 
+            grid.InsertNextCell(cell.GetCellType(), cell.GetPointIds())
         except KeyError:
             continue
 
     return grid
+
 
 
 def make_mapper_actor_scalarbar(grid: vtk.vtkUnstructuredGrid, lut: vtk.vtkLookupTable, title: str):

@@ -1,6 +1,6 @@
 # odb-vtk-visualizer
 
-基于 PyQt5 + VTK 的 Abaqus 物理场可视化工具。通过读取 Abaqus 输入文件（`.inp`）以及导出的物理场数据（`.csv`），实现物理场云图显示和动画播放。
+基于 PyQt5 + VTK 的 Abaqus 物理场可视化工具。通过读取 Abaqus 输入文件（`.inp`）以及导出的物理场数据（`.csv`），实现物理场云图显示、动画播放和数值分析。
 
 ## 项目结构
 
@@ -35,11 +35,12 @@ pip install -r requirements.txt
 
 ### 运行可视化
 
-- 单视窗：`python src/vtk_view.py`
-  - 按界面提示加载 `.inp` 和 `.csv`。
-- 双视窗：`python src/vtk_view_dual.py`
-  - 依次加载 `.inp`、FOM `.csv`、ROM `.csv`。
+运行：`python vtk_view_dual.py`，依次加载 `.inp`、FOM `.csv`、ROM `.csv`。
 
 软件运行效果如下图所示：
 
+<<<<<<< HEAD
   ![软件界面2](/assets/example2.png)
+=======
+  ![软件界面](/assets/example.png)
+>>>>>>> 7b8d5fb (更新 README.md，完善使用说明和软件界面示例)

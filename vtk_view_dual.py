@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import numpy as np
 import pandas as pd
+from matplotlib import cm
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtWidgets import QFileDialog
 from PyQt5.QtGui import QIcon
@@ -194,6 +195,25 @@ def create_colormap_lut(style):
         return create_abaqus_lut()
     if style == "rainbow_2":
         return create_rainbow_2_lut()
+    matplotlib_names = {
+        "viridis": "viridis",
+        "plasma": "plasma",
+        "inferno": "inferno",
+        "magma": "magma",
+        "cividis": "cividis",
+        "turbo": "turbo",
+        "piyg": "PiYG",
+        "coolwarm": "coolwarm",
+    }
+    if style in matplotlib_names:
+        color_map = cm.get_cmap(matplotlib_names[style], 256)
+        lut = vtk.vtkLookupTable()
+        lut.SetNumberOfTableValues(256)
+        lut.Build()
+        for index in range(256):
+            red, green, blue, alpha = color_map(index)
+            lut.SetTableValue(index, red, green, blue, alpha)
+        return lut
     return create_rainbow_lut()
 
 
@@ -1836,7 +1856,7 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
     def _init_ui(self):
         """构建主界面 UI。"""
         self.setWindowTitle("Vtk Visualizer")
-        icon_path = os.path.join(str(_project_root()), "assets", "logo.ico")
+        icon_path = os.path.join(str(_project_root()), "docs", "assets", "logo.ico")
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
         self.resize(1650, 950)
@@ -1874,20 +1894,24 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         self.bg_group = QtWidgets.QActionGroup(self)
         self.bg_group.setExclusive(True)
 
-        act_bg_abaqus = QtWidgets.QAction("abaqus", self)
-        act_bg_abaqus.setCheckable(True)
-        act_bg_abaqus.setChecked(self.background_style == "abaqus")
-        act_bg_abaqus.triggered.connect(lambda: self.set_background_style("abaqus"))
-
-        act_bg_white = QtWidgets.QAction("white", self)
-        act_bg_white.setCheckable(True)
-        act_bg_white.setChecked(self.background_style == "white")
-        act_bg_white.triggered.connect(lambda: self.set_background_style("white"))
-
-        self.bg_group.addAction(act_bg_abaqus)
-        self.bg_group.addAction(act_bg_white)
-        menu_bg.addAction(act_bg_abaqus)
-        menu_bg.addAction(act_bg_white)
+        for label, style in (
+            ("abaqus", "abaqus"),
+            ("black", "black"),
+            ("dark gray", "dark_gray"),
+            ("gray", "gray"),
+            ("light gray", "light_gray"),
+            ("white", "white"),
+            ("navy", "navy"),
+            ("beige", "beige"),
+        ):
+            action = QtWidgets.QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(self.background_style == style)
+            action.triggered.connect(
+                lambda checked=False, name=style: self.set_background_style(name)
+            )
+            self.bg_group.addAction(action)
+            menu_bg.addAction(action)
 
         menu_lut = menu_vis.addMenu("色阶设置")
         self.lut_group = QtWidgets.QActionGroup(self)
@@ -1914,6 +1938,25 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         menu_lut.addAction(act_lut_abaqus)
         menu_lut.addAction(act_lut_grad)
         menu_lut.addAction(act_lut_rainbow_2)
+        menu_lut.addSeparator()
+        for label, style in (
+            ("viridis", "viridis"),
+            ("plasma", "plasma"),
+            ("inferno", "inferno"),
+            ("magma", "magma"),
+            ("cividis", "cividis"),
+            ("turbo", "turbo"),
+            ("PiYG", "piyg"),
+            ("coolwarm", "coolwarm"),
+        ):
+            action = QtWidgets.QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(self.colormap_style == style)
+            action.triggered.connect(
+                lambda checked=False, name=style: self.set_colormap_style(name)
+            )
+            self.lut_group.addAction(action)
+            menu_lut.addAction(action)
 
         self.grid_menu = menu_vis.addMenu("网格设置（当前：关闭）")
         self.grid_action_group = QtWidgets.QActionGroup(self)
@@ -3116,7 +3159,10 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         if not style:
             return
         style = style.strip().lower()
-        if style not in ("abaqus", "white"):
+        if style not in (
+            "abaqus", "black", "dark_gray", "gray", "light_gray",
+            "white", "navy", "beige",
+        ):
             return
         self.background_style = style
         self._apply_background_style(style)
@@ -3127,10 +3173,16 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         if style == "abaqus":
             self._set_abaqus_background(self.ren_l)
             self._set_abaqus_background(self.ren_r)
-        elif style == "white":
-            self._set_white_background(self.ren_l)
-            self._set_white_background(self.ren_r)
+        else:
+            color = self._solid_background_color(style)
+            self._set_solid_background(self.ren_l, color)
+            self._set_solid_background(self.ren_r, color)
         self._apply_scalarbar_text_style()
+        text_color, _use_shadow = self._get_scalarbar_text_style(style)
+        wire_color = (0.75, 0.77, 0.80) if text_color[0] > 0.5 else (0.25, 0.27, 0.30)
+        for actor in (getattr(self, "wire_actor_l", None), getattr(self, "wire_actor_r", None)):
+            if actor is not None:
+                actor.GetProperty().SetColor(*wire_color)
         self.safe_render_both()
 
     def _set_abaqus_background(self, renderer):
@@ -3138,10 +3190,22 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         renderer.SetBackground2(27/255.0, 45/255.0, 70/255.0)
         renderer.SetBackground(158/255.0, 173/255.0, 194/255.0)
 
-    def _set_white_background(self, renderer):
+    @staticmethod
+    def _solid_background_color(style):
+        return {
+            "black": (0.0, 0.0, 0.0),
+            "dark_gray": (0.15, 0.15, 0.15),
+            "gray": (0.5, 0.5, 0.5),
+            "light_gray": (0.8, 0.8, 0.8),
+            "white": (1.0, 1.0, 1.0),
+            "navy": (0.04, 0.08, 0.18),
+            "beige": (0.94, 0.91, 0.82),
+        }.get(style, (1.0, 1.0, 1.0))
+
+    def _set_solid_background(self, renderer, color):
         renderer.GradientBackgroundOff()
-        renderer.SetBackground(1.0, 1.0, 1.0)
-        renderer.SetBackground2(1.0, 1.0, 1.0)
+        renderer.SetBackground(*color)
+        renderer.SetBackground2(*color)
 
     def _apply_scalarbar_text_style(self):
         """根据背景风格自适应图例文字颜色与阴影。"""
@@ -3153,7 +3217,11 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
             self._style_text_property(scalarbar.GetTitleTextProperty(), text_color, use_shadow)
 
     def _get_scalarbar_text_style(self, style):
-        if style == "white":
+        if style == "abaqus":
+            return (0.98, 0.98, 0.98), True
+        red, green, blue = self._solid_background_color(style)
+        luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+        if luminance >= 0.48:
             return (0.08, 0.08, 0.08), False
         return (0.98, 0.98, 0.98), True
 
@@ -3175,7 +3243,10 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         if not style:
             return
         style = style.strip().lower()
-        if style not in ("abaqus", "rainbow_1", "rainbow_2"):
+        if style not in (
+            "abaqus", "rainbow_1", "rainbow_2", "viridis", "plasma",
+            "inferno", "magma", "cividis", "turbo", "piyg", "coolwarm",
+        ):
             return
         self.colormap_style = style
         self._apply_colormap_style(style)
@@ -3349,8 +3420,8 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         self.ren_r.AddViewProp(self.scalarbar_r)  # 加入图例
         self.set_grid_visibility(self.grid_visible)
 
-        # 根据当前背景风格更新图例文字样式
-        self._apply_scalarbar_text_style()
+        # 根据当前背景风格更新图例文字与网格线样式
+        self._apply_background_style(self.background_style)
 
         # 重置相机并渲染
         self.ren_l.ResetCamera()

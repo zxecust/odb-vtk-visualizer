@@ -39,8 +39,4 @@ pip install -r requirements.txt
 
 软件运行效果如下图所示：
 
-<<<<<<< HEAD
-  ![软件界面2](/assets/example2.png)
-=======
   ![软件界面](/assets/example.png)
->>>>>>> 7b8d5fb (更新 README.md，完善使用说明和软件界面示例)

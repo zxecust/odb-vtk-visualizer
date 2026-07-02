@@ -1783,7 +1783,7 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
 
         self.background_style = "abaqus"
         self.colormap_style = "rainbow_1"
-        self.grid_visible = False
+        self.grid_visible = True
         self.hotspot_filter_enabled = False
         self.hotspot_filter_mode = "max_ratio"
         self.hotspot_comparison = "greater"
@@ -1921,12 +1921,12 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
             self.lut_group.addAction(action)
             menu_lut.addAction(action)
 
-        self.grid_menu = menu_vis.addMenu("网格设置（当前：关闭）")
+        self.grid_menu = menu_vis.addMenu("网格设置（当前：开启）")
         self.grid_action_group = QtWidgets.QActionGroup(self)
         self.grid_action_group.setExclusive(True)
         self.grid_on_action = QtWidgets.QAction("开启", self, checkable=True)
         self.grid_off_action = QtWidgets.QAction("关闭", self, checkable=True)
-        self.grid_off_action.setChecked(True)
+        self.grid_on_action.setChecked(True)
         self.grid_on_action.triggered.connect(lambda: self.set_grid_visibility(True))
         self.grid_off_action.triggered.connect(lambda: self.set_grid_visibility(False))
         self.grid_action_group.addAction(self.grid_on_action)

@@ -1,5 +1,6 @@
 pandas
 numpy
 matplotlib
+openpyxl
 pyqt5==5.15.9
 vtk==9.2.6

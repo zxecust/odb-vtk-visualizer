@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import sys
 import os
+import re
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -1448,11 +1449,14 @@ class LocalConsistencyDialog(QtWidgets.QDialog):
         self.status_label = QtWidgets.QLabel("请选择物理场并设置分析参数。", self)
         self.status_label.setWordWrap(True)
         analyze_button = QtWidgets.QPushButton("分析", self)
+        export_button = QtWidgets.QPushButton("导出", self)
         close_button = QtWidgets.QPushButton("关闭", self)
         analyze_button.clicked.connect(self.analyze)
+        export_button.clicked.connect(self.export_data)
         close_button.clicked.connect(self.hide)
         button_row.addWidget(self.status_label, 1)
         button_row.addWidget(analyze_button)
+        button_row.addWidget(export_button)
         button_row.addWidget(close_button)
         settings_layout.addLayout(button_row, 5, 0, 1, 4)
         root.addWidget(settings_group)
@@ -1699,6 +1703,70 @@ class LocalConsistencyDialog(QtWidgets.QDialog):
         self.canvas.draw_idle()
         self.status_label.setText(
             f"节点 {node_id}；{matching_note}；已绘制 {len(frame_indices)} 个时序点。"
+        )
+
+    @staticmethod
+    def _safe_filename_component(value):
+        text = re.sub(r'[<>:"/\\|?*]+', "_", str(value).strip())
+        return text.strip(" ._") or "field"
+
+    def _build_export_dataframe(self):
+        values = self._validate_inputs()
+        use_fom, use_rom, fom_name, rom_name, node_index, node_id, interval, start, end = values
+        frame_indices, fom_values, rom_values, matching_note = self._series_for_plot(
+            use_fom, use_rom, fom_name, rom_name, node_index, start, end
+        )
+        if frame_indices.size == 0:
+            raise ValueError("指定范围内没有可导出的帧。")
+
+        columns = {"Time": frame_indices.astype(float) * interval}
+        if fom_values is not None:
+            columns[f"FE {fom_name}"] = fom_values
+        if rom_values is not None:
+            columns[f"Predicted {rom_name}"] = rom_values
+
+        field_name = fom_name if use_fom else rom_name
+        if self.frame_range_check.isChecked():
+            range_name = f"frames_{start + 1}-{end + 1}"
+        else:
+            range_name = "all_frames"
+        default_name = (
+            f"{self._safe_filename_component(field_name)}_node_{node_id}_{range_name}.csv"
+        )
+        return pd.DataFrame(columns), default_name, node_id, matching_note
+
+    def export_data(self):
+        try:
+            dataframe, default_name, node_id, matching_note = self._build_export_dataframe()
+        except (ValueError, TypeError) as exc:
+            QtWidgets.QMessageBox.warning(self, "无法导出", str(exc))
+            return
+
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "导出局部一致性数据",
+            default_name,
+            "CSV 文件 (*.csv);;Excel 文件 (*.xlsx)",
+        )
+        if not path:
+            return
+
+        suffix = Path(path).suffix.lower()
+        if suffix not in (".csv", ".xlsx"):
+            suffix = ".xlsx" if "Excel" in selected_filter else ".csv"
+            path += suffix
+
+        try:
+            if suffix == ".xlsx":
+                dataframe.to_excel(path, index=False, engine="openpyxl")
+            else:
+                dataframe.to_csv(path, index=False, encoding="utf-8-sig")
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "导出失败", str(exc))
+            return
+
+        self.status_label.setText(
+            f"节点 {node_id}；{matching_note}；已导出 {len(dataframe)} 行数据到 {path}"
         )
 
     def closeEvent(self, event):

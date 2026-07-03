@@ -190,7 +190,7 @@ def create_rainbow_lut(num_colors=256):
     return lut
 
 
-def create_rainbow_2_lut():
+def create_banded_rainbow_lut():
     lut = vtk.vtkLookupTable()
     lut.SetNumberOfTableValues(12)
     lut.Build()
@@ -216,8 +216,8 @@ def create_rainbow_2_lut():
 def create_colormap_lut(style):
     if style == "abaqus":
         return create_abaqus_lut()
-    if style == "rainbow_2":
-        return create_rainbow_2_lut()
+    if style == "banded_rainbow":
+        return create_banded_rainbow_lut()
     matplotlib_names = {
         "viridis": "viridis",
         "plasma": "plasma",
@@ -2210,7 +2210,7 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         self.lut_right = create_rainbow_lut()  
 
         self.background_style = "abaqus"
-        self.colormap_style = "rainbow_1"
+        self.colormap_style = "rainbow"
         self.grid_visible = True
         self.hotspot_filter_enabled = False
         self.hotspot_filter_mode = "max_ratio"
@@ -2306,32 +2306,13 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
             menu_bg.addAction(action)
 
         menu_lut = menu_vis.addMenu("色阶设置")
+        menu_lut_continuous = menu_lut.addMenu("连续色阶")
+        menu_lut_discrete = menu_lut.addMenu("离散色阶")
         self.lut_group = QtWidgets.QActionGroup(self)
         self.lut_group.setExclusive(True)
 
-        act_lut_abaqus = QtWidgets.QAction("abaqus", self)
-        act_lut_abaqus.setCheckable(True)
-        act_lut_abaqus.setChecked(self.colormap_style == "abaqus")
-        act_lut_abaqus.triggered.connect(lambda: self.set_colormap_style("abaqus"))
-
-        act_lut_grad = QtWidgets.QAction("rainbow 1", self)
-        act_lut_grad.setCheckable(True)
-        act_lut_grad.setChecked(self.colormap_style == "rainbow_1")
-        act_lut_grad.triggered.connect(lambda: self.set_colormap_style("rainbow_1"))
-
-        act_lut_rainbow_2 = QtWidgets.QAction("rainbow 2", self)
-        act_lut_rainbow_2.setCheckable(True)
-        act_lut_rainbow_2.setChecked(self.colormap_style == "rainbow_2")
-        act_lut_rainbow_2.triggered.connect(lambda: self.set_colormap_style("rainbow_2"))
-
-        self.lut_group.addAction(act_lut_abaqus)
-        self.lut_group.addAction(act_lut_grad)
-        self.lut_group.addAction(act_lut_rainbow_2)
-        menu_lut.addAction(act_lut_abaqus)
-        menu_lut.addAction(act_lut_grad)
-        menu_lut.addAction(act_lut_rainbow_2)
-        menu_lut.addSeparator()
         for label, style in (
+            ("rainbow", "rainbow"),
             ("viridis", "viridis"),
             ("plasma", "plasma"),
             ("inferno", "inferno"),
@@ -2348,7 +2329,20 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
                 lambda checked=False, name=style: self.set_colormap_style(name)
             )
             self.lut_group.addAction(action)
-            menu_lut.addAction(action)
+            menu_lut_continuous.addAction(action)
+
+        for label, style in (
+            ("abaqus", "abaqus"),
+            ("banded rainbow", "banded_rainbow"),
+        ):
+            action = QtWidgets.QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(self.colormap_style == style)
+            action.triggered.connect(
+                lambda checked=False, name=style: self.set_colormap_style(name)
+            )
+            self.lut_group.addAction(action)
+            menu_lut_discrete.addAction(action)
 
         self.grid_menu = menu_vis.addMenu("网格设置")
         self.grid_action_group = QtWidgets.QActionGroup(self)
@@ -3632,7 +3626,7 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
             return
         style = style.strip().lower()
         if style not in (
-            "abaqus", "rainbow_1", "rainbow_2", "viridis", "plasma",
+            "abaqus", "rainbow", "banded_rainbow", "viridis", "plasma",
             "inferno", "magma", "cividis", "turbo", "piyg", "coolwarm",
         ):
             return

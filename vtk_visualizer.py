@@ -22,6 +22,9 @@ vtk.vtkOutputWindow.SetInstance(VTK_OUTPUT_WINDOW)
 ROTATION_AXIS_ORIGIN = np.array([0.0, 0.0, 0.0], dtype=float)
 ROTATION_STEP_DEGREES = 5.0
 PLANAR_TOLERANCE_FACTOR = 1.0e-8
+ABAQUS_MESH_SURFACE_RGB = (0, 210, 210)
+ABAQUS_MESH_SURFACE_COLOR = tuple(channel / 255.0 for channel in ABAQUS_MESH_SURFACE_RGB)
+DEFAULT_MESH_SURFACE_COLOR = (0.86, 0.86, 0.86)
 FONT_REGULAR_NAME = "NotoSansCJKsc-Regular.otf"
 FONT_MEDIUM_NAME = "NotoSansCJKsc-Medium.otf"
 FONT_BOLD_NAME = "NotoSansCJKsc-Bold.otf"
@@ -155,6 +158,69 @@ def read_field_csv(csv_path, node_count):
 
     field_name = os.path.splitext(os.path.basename(csv_path))[0] 
     return field_name, data, frames
+
+
+def _normalize_field_data_array(data, node_count, source_path):
+    data = np.asarray(data)
+    if not np.issubdtype(data.dtype, np.number):
+        data = data.astype(float)
+    if data.ndim == 1:
+        if data.shape[0] != node_count:
+            raise ValueError(
+                f"NPY 数据与 INP 节点数不匹配：NPY长度={data.shape[0]}，INP节点={node_count}"
+            )
+        data = data.reshape(1, node_count)
+    elif data.ndim == 2:
+        if data.shape[1] == node_count:
+            pass
+        elif data.shape[0] == node_count:
+            data = data.T
+        else:
+            raise ValueError(
+                f"NPY 数据与 INP 节点数不匹配：NPY形状={data.shape}，INP节点={node_count}"
+            )
+    else:
+        raise ValueError(f"NPY 数据维度必须是 1 维或 2 维：{source_path}")
+    return data
+
+
+def read_field_npy(npy_path, node_count):
+    loaded = np.load(npy_path, allow_pickle=True)
+    field_name = os.path.splitext(os.path.basename(npy_path))[0]
+    frames = None
+
+    if isinstance(loaded, np.ndarray) and loaded.shape == () and loaded.dtype == object:
+        obj = loaded.item()
+        if isinstance(obj, dict):
+            data = obj.get("data", obj.get("values", obj.get("field")))
+            if data is None:
+                raise ValueError(f"NPY 字典缺少 data/values/field 字段：{npy_path}")
+            frames = obj.get("frames", obj.get("frame_indices", obj.get("time")))
+            field_name = str(obj.get("name", obj.get("field_name", field_name)))
+        else:
+            data = obj
+    else:
+        data = loaded
+
+    data = _normalize_field_data_array(data, node_count, npy_path)
+    if frames is None:
+        frames = np.arange(data.shape[0], dtype=int).astype(str)
+    else:
+        frames = np.asarray(frames).astype(str).ravel()
+        if frames.size != data.shape[0]:
+            raise ValueError(
+                f"NPY 帧数与数据不匹配：帧数={frames.size}，数据帧数={data.shape[0]}"
+            )
+    return field_name, data, frames
+
+
+def read_field_file(path, node_count):
+    suffix = os.path.splitext(path)[1].lower()
+    if suffix == ".csv":
+        return read_field_csv(path, node_count)
+    if suffix == ".npy":
+        return read_field_npy(path, node_count)
+    raise ValueError(f"不支持的物理场文件格式：{suffix}")
 
 def create_abaqus_lut():
     lut = vtk.vtkLookupTable()
@@ -316,7 +382,7 @@ class CsvLoadWorker(QtCore.QObject):
             start = int(index * 100 / total)
             self.progress.emit(start, f"正在读取 {filename}（{index + 1}/{total}）")
             try:
-                name, data, frames = read_field_csv(path, self.node_count)
+                name, data, frames = read_field_file(path, self.node_count)
                 if self.cancel_requested:
                     break
                 self.progress.emit(
@@ -555,6 +621,61 @@ def build_unstructured_grid(node_ids, coords, elements):
     return grid
 
 
+def _mirrored_element_node_order(nodes, elem_type):
+    nodes = list(nodes)
+    et = (elem_type or "").upper()
+    n = len(nodes)
+    if n == 3:
+        return [nodes[index] for index in (0, 2, 1)]
+    if n == 4:
+        if et.startswith("C3D4"):
+            return [nodes[index] for index in (0, 2, 1, 3)]
+        return [nodes[index] for index in (0, 3, 2, 1)]
+    if n == 6:
+        return [nodes[index] for index in (0, 2, 1, 3, 5, 4)]
+    if n == 8:
+        if et.startswith(("CPS8", "CPE8", "CAX8", "S8")):
+            return [nodes[index] for index in (0, 3, 2, 1, 7, 6, 5, 4)]
+        return [nodes[index] for index in (0, 3, 2, 1, 4, 7, 6, 5)]
+    return list(reversed(nodes))
+
+
+def build_mirrored_grid(node_ids, coords, elements, normal, point_on_plane):
+    xyz = _coords_3d(coords)
+    normal = np.asarray(normal, dtype=float).reshape(3)
+    normal_norm = float(np.linalg.norm(normal))
+    if normal_norm <= 1.0e-12:
+        raise ValueError("镜像面法向量不能为零。")
+    normal = normal / normal_norm
+    point_on_plane = np.asarray(point_on_plane, dtype=float).reshape(3)
+    signed_distances = xyz @ normal - float(point_on_plane @ normal)
+    mirrored_xyz = xyz - 2.0 * signed_distances[:, None] * normal
+    combined_coords = np.vstack([xyz, mirrored_xyz])
+
+    node_count = len(node_ids)
+    mirrored_node_ids = [int(node_id) + node_count for node_id in node_ids]
+    while set(node_ids).intersection(mirrored_node_ids):
+        node_count *= 10
+        mirrored_node_ids = [int(node_id) + node_count for node_id in node_ids]
+    combined_node_ids = np.concatenate([np.asarray(node_ids), np.asarray(mirrored_node_ids)])
+    mirror_id_map = {
+        int(source_id): int(mirror_id)
+        for source_id, mirror_id in zip(node_ids, mirrored_node_ids)
+    }
+    combined_elements = list(elements)
+    for elem in elements:
+        nodes, elem_type = _unpack_element(elem)
+        mirrored_ordered_nodes = _mirrored_element_node_order(nodes, elem_type)
+        mirrored_nodes = [mirror_id_map[int(node_id)] for node_id in mirrored_ordered_nodes]
+        combined_elements.append((mirrored_nodes, elem_type))
+    grid = build_unstructured_grid(combined_node_ids, combined_coords, combined_elements)
+    source_indices = np.concatenate([
+        np.arange(len(node_ids), dtype=np.int64),
+        np.arange(len(node_ids), dtype=np.int64),
+    ])
+    return grid, source_indices
+
+
 def _coords_3d(coords):
     arr = np.asarray(coords, dtype=float)
     if arr.ndim != 2 or arr.shape[1] not in (2, 3):
@@ -638,6 +759,131 @@ def _rotate_points(points, axis, origin, angle_radians):
     )
 
 
+def build_arrayed_grid(
+    node_ids, coords, elements, axis, origin, count, total_angle_degrees, axial_shift=0.0
+):
+    count = int(count)
+    if count < 1:
+        raise ValueError("阵列数量必须大于等于 1。")
+    xyz = _coords_3d(coords)
+    axis = np.asarray(axis, dtype=float).reshape(3)
+    axis_norm = float(np.linalg.norm(axis))
+    if axis_norm <= 1.0e-12:
+        raise ValueError("阵列轴方向不能为零。")
+    axis = axis / axis_norm
+    origin = np.asarray(origin, dtype=float).reshape(3)
+    xyz = xyz + float(axial_shift) * axis
+    total_angle_radians = np.deg2rad(float(total_angle_degrees))
+    angles = np.arange(count, dtype=float) * total_angle_radians / float(count)
+
+    rotated_layers = [
+        _rotate_points(xyz, axis, origin, angle)
+        for angle in angles
+    ]
+    combined_coords = np.vstack(rotated_layers)
+    source_indices = np.tile(np.arange(len(node_ids), dtype=np.int64), count)
+
+    id_to_index = {int(node_id): index for index, node_id in enumerate(node_ids)}
+    synthetic_node_ids = np.arange(1, combined_coords.shape[0] + 1, dtype=np.int64)
+    combined_elements = []
+    node_count = len(node_ids)
+    for copy_index in range(count):
+        offset = copy_index * node_count
+        for elem in elements:
+            nodes, elem_type = _unpack_element(elem)
+            try:
+                copied_nodes = [
+                    int(synthetic_node_ids[offset + id_to_index[int(node_id)]])
+                    for node_id in nodes
+                ]
+            except KeyError:
+                continue
+            combined_elements.append((copied_nodes, elem_type))
+    grid = build_unstructured_grid(synthetic_node_ids, combined_coords, combined_elements)
+    return grid, source_indices
+
+
+def extract_surface_with_source_indices(grid):
+    if grid is None:
+        raise ValueError("无法从空网格提取外表面。")
+    id_name = "__source_point_id__"
+    surface_filter = vtk.vtkDataSetSurfaceFilter()
+    surface_filter.SetInputData(grid)
+    surface_filter.PassThroughPointIdsOn()
+    surface_filter.SetOriginalPointIdsName(id_name)
+    surface_filter.Update()
+    surface = vtk.vtkPolyData()
+    surface.DeepCopy(surface_filter.GetOutput())
+    original_ids = surface.GetPointData().GetArray(id_name)
+    if original_ids is None:
+        raise ValueError("外表面提取失败：缺少原始点编号映射。")
+    source_indices = np.array(
+        [int(original_ids.GetTuple1(index)) for index in range(surface.GetNumberOfPoints())],
+        dtype=np.int64,
+    )
+    surface.GetPointData().RemoveArray(id_name)
+    return surface, source_indices
+
+
+def build_arrayed_surface_grid(
+    node_ids, coords, elements, axis, origin, count, total_angle_degrees, axial_shift=0.0
+):
+    count = int(count)
+    if count < 1:
+        raise ValueError("阵列数量必须大于等于 1。")
+    base_grid = build_unstructured_grid(node_ids, coords, elements)
+    surface, surface_source_indices = extract_surface_with_source_indices(base_grid)
+    surface_points = surface.GetPoints()
+    if surface_points is None or surface.GetNumberOfPoints() == 0:
+        raise ValueError("原始模型没有可用于阵列显示的外表面。")
+
+    base_points = np.array(
+        [surface_points.GetPoint(index) for index in range(surface.GetNumberOfPoints())],
+        dtype=float,
+    )
+    axis = np.asarray(axis, dtype=float).reshape(3)
+    axis_norm = float(np.linalg.norm(axis))
+    if axis_norm <= 1.0e-12:
+        raise ValueError("阵列轴方向不能为零。")
+    axis = axis / axis_norm
+    origin = np.asarray(origin, dtype=float).reshape(3)
+    base_points = base_points + float(axial_shift) * axis
+    total_angle_radians = np.deg2rad(float(total_angle_degrees))
+    angles = np.arange(count, dtype=float) * total_angle_radians / float(count)
+
+    output_points = vtk.vtkPoints()
+    output_polys = vtk.vtkCellArray()
+    point_count = surface.GetNumberOfPoints()
+    for angle in angles:
+        rotated = _rotate_points(base_points, axis, origin, angle)
+        for point in rotated:
+            output_points.InsertNextPoint(float(point[0]), float(point[1]), float(point[2]))
+
+    for copy_index in range(count):
+        offset = copy_index * point_count
+        for cell_index in range(surface.GetNumberOfCells()):
+            cell = surface.GetCell(cell_index)
+            if cell is None:
+                continue
+            ids = cell.GetPointIds()
+            n_ids = ids.GetNumberOfIds()
+            if n_ids < 3:
+                continue
+            polygon = vtk.vtkPolygon()
+            polygon.GetPointIds().SetNumberOfIds(n_ids)
+            for local_index in range(n_ids):
+                polygon.GetPointIds().SetId(local_index, offset + int(ids.GetId(local_index)))
+            output_polys.InsertNextCell(polygon)
+
+    output = vtk.vtkPolyData()
+    output.SetPoints(output_points)
+    output.SetPolys(output_polys)
+    output.BuildCells()
+    output.BuildLinks()
+    source_indices = np.tile(surface_source_indices, count)
+    return output, source_indices
+
+
 def build_rotational_surface(node_ids, coords, elements, axis_index, angle_degrees, offset_distance):
     xyz = _coords_3d(coords)
     planar_axis = detect_planar_axis(xyz)
@@ -694,6 +940,7 @@ def build_rotational_surface(node_ids, coords, elements, axis_index, angle_degre
         layer_point_ids.append(point_ids)
 
     polygons = vtk.vtkCellArray()
+    side_polygons = vtk.vtkCellArray()
     cap_polygons = vtk.vtkCellArray()
     layer_count = len(angles)
     side_steps = layer_count if closed else layer_count - 1
@@ -706,6 +953,7 @@ def build_rotational_surface(node_ids, coords, elements, axis_index, angle_degre
             quad.GetPointIds().SetId(2, layer_point_ids[next_layer][end])
             quad.GetPointIds().SetId(3, layer_point_ids[next_layer][start])
             polygons.InsertNextCell(quad)
+            side_polygons.InsertNextCell(quad)
 
     if not closed:
         for layer_index, reverse_order in ((0, True), (layer_count - 1, False)):
@@ -734,7 +982,13 @@ def build_rotational_surface(node_ids, coords, elements, axis_index, angle_degre
     cap_polydata.SetPolys(cap_polygons)
     cap_polydata.BuildCells()
     cap_polydata.BuildLinks()
-    return polydata, cap_polydata, np.asarray(source_indices, dtype=np.int64)
+
+    side_polydata = vtk.vtkPolyData()
+    side_polydata.SetPoints(vtk_points)
+    side_polydata.SetPolys(side_polygons)
+    side_polydata.BuildCells()
+    side_polydata.BuildLinks()
+    return polydata, cap_polydata, side_polydata, np.asarray(source_indices, dtype=np.int64)
 
 
 
@@ -747,6 +1001,7 @@ def make_mapper_actor_scalarbar(grid, lut, title):
 
     actor = vtk.vtkActor()
     actor.SetMapper(mapper)
+    actor.GetProperty().SetColor(*DEFAULT_MESH_SURFACE_COLOR)
 
     scalar_bar = vtk.vtkScalarBarActor()
     scalar_bar.SetLookupTable(lut) 
@@ -1919,6 +2174,10 @@ class RotationalTransparencyDialog(QtWidgets.QDialog):
         row.addWidget(self.slider, 1)
         row.addWidget(self.spinbox)
         root.addLayout(row)
+        self.exterior_wire_check = QtWidgets.QCheckBox("\u4ec5\u663e\u793a\u5916\u8868\u9762\u7f51\u683c", self)
+        self.exterior_wire_check.setChecked(self.owner.rotational_exterior_wire_only)
+        root.addWidget(self.exterior_wire_check)
+
 
         note = QtWidgets.QLabel(
             "仅影响旋转实体的外表面；起始和结束端面保持不透明。", self
@@ -1932,6 +2191,7 @@ class RotationalTransparencyDialog(QtWidgets.QDialog):
 
         self.slider.valueChanged.connect(self._slider_changed)
         self.spinbox.valueChanged.connect(self._spinbox_changed)
+        self.exterior_wire_check.toggled.connect(self.owner.set_rotational_exterior_wire_only)
 
     def _slider_changed(self, value):
         self.spinbox.blockSignals(True)
@@ -2175,6 +2435,11 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         self.display_source_indices_l = None
         self.display_source_indices_r = None
         self.is_rotational_surface = False
+        self.is_mirrored_surface = False
+        self.is_arrayed_surface = False
+        self.rotational_side_grid_l = None
+        self.rotational_side_grid_r = None
+        self.rotational_exterior_wire_only = False
         self.rotational_surface_transparency = 0.0
         self.rotational_transparency_dialog = None
         self.node_filter_dialog = None
@@ -2185,6 +2450,12 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         self.cap_mapper_r = None
         self.cap_actor_l = None
         self.cap_actor_r = None
+        self.outline_filter_l = None
+        self.outline_filter_r = None
+        self.outline_mapper_l = None
+        self.outline_mapper_r = None
+        self.outline_actor_l = None
+        self.outline_actor_r = None
 
         self.fields = {}
         self.current_field = ""
@@ -2205,12 +2476,15 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         self._closing = False 
         self._background_tasks = []
         self._field_data_epoch = 0
+        self._lookup_table_cache_key = None
+        self._wireframe_dirty = True
 
         self.lut_left = create_rainbow_lut() 
         self.lut_right = create_rainbow_lut()  
 
         self.background_style = "abaqus"
         self.colormap_style = "rainbow"
+        self.grid_display_mode = "full"
         self.grid_visible = True
         self.hotspot_filter_enabled = False
         self.hotspot_filter_mode = "max_ratio"
@@ -2267,11 +2541,11 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         act_inp.triggered.connect(self.open_inp)
         menu_load.addAction(act_inp)
 
-        act_csv = QtWidgets.QAction("加载CSV文件（FOM）", self)
+        act_csv = QtWidgets.QAction("加载物理场文件（FOM）", self)
         act_csv.triggered.connect(self.open_csv_left)
         menu_load.addAction(act_csv)
 
-        act_rom = QtWidgets.QAction("加载CSV文件（ROM）", self)
+        act_rom = QtWidgets.QAction("加载物理场文件（ROM）", self)
         act_rom.triggered.connect(self.open_csv_right)
         menu_load.addAction(act_rom)
 
@@ -2344,18 +2618,24 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
             self.lut_group.addAction(action)
             menu_lut_discrete.addAction(action)
 
-        self.grid_menu = menu_vis.addMenu("网格设置")
+        self.grid_menu = menu_vis.addMenu("\u7f51\u683c\u8bbe\u7f6e")
         self.grid_action_group = QtWidgets.QActionGroup(self)
         self.grid_action_group.setExclusive(True)
-        self.grid_on_action = QtWidgets.QAction("开启", self, checkable=True)
-        self.grid_off_action = QtWidgets.QAction("关闭", self, checkable=True)
-        self.grid_on_action.setChecked(True)
-        self.grid_on_action.triggered.connect(lambda: self.set_grid_visibility(True))
-        self.grid_off_action.triggered.connect(lambda: self.set_grid_visibility(False))
-        self.grid_action_group.addAction(self.grid_on_action)
-        self.grid_action_group.addAction(self.grid_off_action)
-        self.grid_menu.addAction(self.grid_on_action)
-        self.grid_menu.addAction(self.grid_off_action)
+        self.grid_mode_actions = {}
+        for label, mode in (
+            ("\u5173\u95ed", "off"),
+            ("\u5f00\u542f", "full"),
+        ):
+            action = QtWidgets.QAction(label, self, checkable=True)
+            action.setChecked(self.grid_display_mode == mode)
+            action.triggered.connect(
+                lambda checked=False, selected_mode=mode: self.set_grid_display_mode(selected_mode)
+            )
+            self.grid_action_group.addAction(action)
+            self.grid_menu.addAction(action)
+            self.grid_mode_actions[mode] = action
+        self.grid_off_action = self.grid_mode_actions["off"]
+        self.grid_on_action = self.grid_mode_actions["full"]
 
         view_menu = menu_vis.addMenu("视角设置")
         for label, view_name in (
@@ -2384,6 +2664,7 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         node_filter_action.triggered.connect(self.show_node_filter_dialog)
         menu_vis.addAction(node_filter_action)
 
+        menu_vis.addSeparator()
         menu_rotate = menu_vis.addMenu("旋转实体")
         self.rotation_actions = []
         for axis_index, axis_name in enumerate(("X", "Y", "Z")):
@@ -2403,6 +2684,50 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         self.restore_2d_action.triggered.connect(self.restore_2d_mesh)
         self.restore_2d_action.setEnabled(False)
         menu_rotate.addAction(self.restore_2d_action)
+
+        mirror_menu = menu_vis.addMenu("\u955c\u50cf\u5b9e\u4f53")
+        self.mirror_actions = []
+        for axis_index, axis_name in enumerate(("X", "Y", "Z")):
+            action = QtWidgets.QAction(f"\u4ee5 {axis_name}=0 \u5e73\u9762\u955c\u50cf", self)
+            action.triggered.connect(
+                lambda checked=False, index=axis_index: self.apply_axis_mirror(index, 0.0)
+            )
+            action.setEnabled(False)
+            mirror_menu.addAction(action)
+            self.mirror_actions.append(action)
+        mirror_menu.addSeparator()
+        custom_mirror_action = QtWidgets.QAction("\u81ea\u5b9a\u4e49\u955c\u50cf\u9762...", self)
+        custom_mirror_action.triggered.connect(self.open_mirror_dialog)
+        custom_mirror_action.setEnabled(False)
+        mirror_menu.addAction(custom_mirror_action)
+        self.mirror_actions.append(custom_mirror_action)
+        mirror_menu.addSeparator()
+        self.restore_mirror_action = QtWidgets.QAction("\u6062\u590d\u539f\u59cb\u6a21\u578b", self)
+        self.restore_mirror_action.triggered.connect(self.restore_2d_mesh)
+        self.restore_mirror_action.setEnabled(False)
+        mirror_menu.addAction(self.restore_mirror_action)
+
+        array_menu = menu_vis.addMenu("\u9635\u5217\u5b9e\u4f53")
+        self.array_actions = []
+        for axis_index, axis_name in enumerate(("X", "Y", "Z")):
+            action = QtWidgets.QAction(f"\u4ee5 {axis_name} \u8f74\u4e3a\u4e2d\u5fc3", self)
+            action.triggered.connect(
+                lambda checked=False, index=axis_index: self.open_array_dialog(index)
+            )
+            action.setEnabled(False)
+            array_menu.addAction(action)
+            self.array_actions.append(action)
+        array_menu.addSeparator()
+        custom_array_action = QtWidgets.QAction("\u81ea\u5b9a\u4e49\u9635\u5217...", self)
+        custom_array_action.triggered.connect(self.open_array_dialog)
+        custom_array_action.setEnabled(False)
+        array_menu.addAction(custom_array_action)
+        self.array_actions.append(custom_array_action)
+        array_menu.addSeparator()
+        self.restore_array_action = QtWidgets.QAction("\u6062\u590d\u539f\u59cb\u6a21\u578b", self)
+        self.restore_array_action.triggered.connect(self.restore_2d_mesh)
+        self.restore_array_action.setEnabled(False)
+        array_menu.addAction(self.restore_array_action)
 
         menu_analysis = menubar.addMenu("数值分析")
         query_menu = menu_analysis.addMenu("查询")
@@ -2564,13 +2889,146 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         self.slider.setEnabled(enabled)
 
     def set_grid_visibility(self, visible):
-        self.grid_visible = bool(visible)
-        self.grid_on_action.setChecked(self.grid_visible)
-        self.grid_off_action.setChecked(not self.grid_visible)
+        self.set_grid_display_mode("full" if visible else "off")
+
+    def set_grid_display_mode(self, mode):
+        if mode not in ("off", "full"):
+            return
+        self.grid_display_mode = mode
+        self.grid_visible = mode != "off"
+        for action_mode, action in getattr(self, "grid_mode_actions", {}).items():
+            action.setChecked(action_mode == mode)
+        self._apply_grid_display_mode()
+        if getattr(self, "current_field", "") in getattr(self, "fields", {}):
+            self.update_both_views()
+        else:
+            self.safe_render_both()
+
+    def _mark_wireframe_dirty(self):
+        self._wireframe_dirty = True
+
+    def _wire_source_grids(self):
+        if (
+            self.is_rotational_surface
+            and self.rotational_exterior_wire_only
+            and self.rotational_side_grid_l is not None
+            and self.rotational_side_grid_r is not None
+        ):
+            return self.rotational_side_grid_l, self.rotational_side_grid_r
+        return self.grid_l, self.grid_r
+
+    def _ensure_wireframe_ready(self):
+        if not hasattr(self, "wire_mapper_l") or not hasattr(self, "wire_mapper_r"):
+            return
+        if not self._wire_should_be_visible() or not self._wireframe_dirty:
+            return
+        left_grid, right_grid = self._wire_source_grids()
+        if left_grid is None or right_grid is None:
+            return
+        self.wire_mapper_l.SetInputData(build_mesh_edge_polydata(left_grid))
+        self.wire_mapper_r.SetInputData(build_mesh_edge_polydata(right_grid))
+        self._wireframe_dirty = False
+
+    def _wire_should_be_visible(self):
+        return self.grid_display_mode == "full"
+
+    def _mesh_surface_color_for_grid_mode(self):
+        if self.grid_display_mode == "full":
+            return ABAQUS_MESH_SURFACE_COLOR
+        return DEFAULT_MESH_SURFACE_COLOR
+
+    def _apply_mesh_surface_color(self):
+        color = self._mesh_surface_color_for_grid_mode()
+        for actor in (
+            getattr(self, "actor_l", None),
+            getattr(self, "actor_r", None),
+            self.cap_actor_l,
+            self.cap_actor_r,
+        ):
+            if actor is not None:
+                prop = actor.GetProperty()
+                prop.SetColor(*color)
+                prop.Modified()
+
+    @staticmethod
+    def _relative_luminance(rgb):
+        red, green, blue = [float(channel) for channel in rgb[:3]]
+        return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+    def _lut_luminance_for_values(self, values, lut, scalar_range):
+        if values is None or lut is None:
+            return np.array([], dtype=float)
+        arr = np.asarray(values, dtype=float).ravel()
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return np.array([], dtype=float)
+        if arr.size > 5000:
+            step = int(np.ceil(arr.size / 5000.0))
+            arr = arr[::step]
+        scalar_min, scalar_max = [float(value) for value in scalar_range]
+        if scalar_max - scalar_min <= 1.0e-12:
+            normalized = np.zeros_like(arr, dtype=float)
+        else:
+            normalized = (arr - scalar_min) / (scalar_max - scalar_min)
+        normalized = np.clip(normalized, 0.0, 1.0)
+        table_size = max(int(lut.GetNumberOfTableValues()), 1)
+        indices = np.clip((normalized * (table_size - 1)).astype(int), 0, table_size - 1)
+        luminance = np.empty(indices.size, dtype=float)
+        for output_index, table_index in enumerate(indices):
+            red, green, blue, _alpha = lut.GetTableValue(int(table_index))
+            luminance[output_index] = self._relative_luminance((red, green, blue))
+        return luminance
+
+    def _auto_wire_color_from_luminance(self, luminance):
+        luminance = np.asarray(luminance, dtype=float)
+        luminance = luminance[np.isfinite(luminance)]
+        if luminance.size == 0:
+            base_luminance = self._relative_luminance(self._mesh_surface_color_for_grid_mode())
+        else:
+            base_luminance = float(np.median(luminance))
+        return (0.96, 0.96, 0.96) if base_luminance < 0.45 else (0.05, 0.05, 0.05)
+
+    def _set_wire_and_outline_color(self, color):
+        for actor in (
+            getattr(self, "wire_actor_l", None),
+            getattr(self, "wire_actor_r", None),
+            self.outline_actor_l,
+            self.outline_actor_r,
+        ):
+            if actor is not None:
+                prop = actor.GetProperty()
+                prop.SetColor(*color)
+                prop.Modified()
+
+    def _update_wire_color_for_current_view(
+        self,
+        left_values=None,
+        right_values=None,
+        left_lut=None,
+        right_lut=None,
+        left_range=None,
+        right_range=None,
+    ):
+        samples = []
+        if left_values is not None and left_lut is not None and left_range is not None:
+            samples.append(self._lut_luminance_for_values(left_values, left_lut, left_range))
+        if right_values is not None and right_lut is not None and right_range is not None:
+            samples.append(self._lut_luminance_for_values(right_values, right_lut, right_range))
+        non_empty_samples = [sample for sample in samples if sample.size]
+        if non_empty_samples:
+            luminance = np.concatenate(non_empty_samples)
+        else:
+            luminance = np.array([], dtype=float)
+        self._set_wire_and_outline_color(self._auto_wire_color_from_luminance(luminance))
+
+    def _apply_grid_display_mode(self):
+        self._ensure_wireframe_ready()
         for actor in (getattr(self, "wire_actor_l", None), getattr(self, "wire_actor_r", None)):
             if actor is not None:
-                actor.SetVisibility(self.grid_visible)
-        self.safe_render_both()
+                actor.SetVisibility(self._wire_should_be_visible())
+        self._apply_mesh_surface_color()
+        self._update_wire_color_for_current_view()
+        self._update_rotational_outline_visibility()
 
     def set_node_query_enabled(self, enabled):
         self.node_query_enabled = bool(enabled)
@@ -3259,6 +3717,7 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         return values > threshold
 
     def _apply_hotspot_lookup_tables(self, scalar_min, scalar_max, threshold):
+        self._lookup_table_cache_key = None
         base_lut = create_colormap_lut(self.colormap_style)
         base_lut.SetRange(scalar_min, scalar_max)
         base_lut.Build()
@@ -3274,10 +3733,14 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         self._install_lookup_table_pair(base_lut, scalar_min, scalar_max)
 
     def _apply_opaque_lookup_tables(self, scalar_min, scalar_max):
+        cache_key = ("opaque", self.colormap_style, float(scalar_min), float(scalar_max))
+        if self._lookup_table_cache_key == cache_key:
+            return
         base_lut = create_colormap_lut(self.colormap_style)
         base_lut.SetRange(scalar_min, scalar_max)
         base_lut.Build()
         self._install_lookup_table_pair(base_lut, scalar_min, scalar_max)
+        self._lookup_table_cache_key = cache_key
 
     def _install_lookup_table_pair(self, source_lut, scalar_min, scalar_max):
         lut_left = vtk.vtkLookupTable()
@@ -3348,6 +3811,7 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
     def _install_independent_lookup_tables(
         self, left_range, right_range, left_values=None, right_values=None
     ):
+        self._lookup_table_cache_key = None
         left_min, left_max = left_range
         right_min, right_max = right_range
         self.lut_left = self._make_view_lut(left_min, left_max, left_values)
@@ -3388,20 +3852,117 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         self._apply_rotational_surface_opacity()
         self.safe_render_both()
 
+    def set_rotational_exterior_wire_only(self, enabled):
+        self.rotational_exterior_wire_only = bool(enabled)
+        self._mark_wireframe_dirty()
+        self._apply_grid_display_mode()
+        if getattr(self, "current_field", "") in getattr(self, "fields", {}):
+            self.update_both_views()
+        else:
+            self.safe_render_both()
+
+    @staticmethod
+    def _set_dataset_point_scalars(dataset, scalars):
+        if dataset is None:
+            return
+        point_data = dataset.GetPointData()
+        point_data.SetScalars(scalars)
+        if scalars is not None:
+            scalars.Modified()
+        point_data.Modified()
+
     def _apply_rotational_surface_opacity(self):
         opacity = (
             1.0 - self.rotational_surface_transparency / 100.0
             if self.is_rotational_surface
             else 1.0
         )
+        surface_visible = opacity > 1.0e-6
         for actor in (getattr(self, "actor_l", None), getattr(self, "actor_r", None)):
             if actor is not None:
                 actor.GetProperty().SetOpacity(opacity)
+                actor.SetVisibility(surface_visible)
                 actor.GetProperty().Modified()
         for actor in (self.cap_actor_l, self.cap_actor_r):
             if actor is not None:
                 actor.GetProperty().SetOpacity(1.0)
                 actor.SetVisibility(self.is_rotational_surface)
+        self._update_rotational_outline_visibility()
+
+    def _rotational_surface_opacity(self):
+        if not self.is_rotational_surface:
+            return 1.0
+        return 1.0 - self.rotational_surface_transparency / 100.0
+
+    def _rotational_outline_should_be_visible(self):
+        return (
+            self.is_rotational_surface
+            and (
+                self.grid_display_mode == "off"
+                or (self.grid_display_mode == "full" and self.rotational_exterior_wire_only)
+            )
+        )
+
+    def _update_rotational_outline_visibility(self):
+        visible = self._rotational_outline_should_be_visible()
+        for actor in (self.outline_actor_l, self.outline_actor_r):
+            if actor is not None:
+                actor.SetVisibility(visible)
+                actor.Modified()
+
+    def _apply_outline_actor_style(self):
+        color = self._auto_wire_color_from_luminance(np.array([], dtype=float))
+        for actor in (self.outline_actor_l, self.outline_actor_r):
+            if actor is not None:
+                prop = actor.GetProperty()
+                prop.SetColor(*color)
+                prop.SetOpacity(1.0)
+                prop.SetLineWidth(1.6)
+                prop.Modified()
+
+    def _remove_rotational_outline_actors(self):
+        for renderer, actor in (
+            (getattr(self, "ren_l", None), self.outline_actor_l),
+            (getattr(self, "ren_r", None), self.outline_actor_r),
+        ):
+            if renderer is not None and actor is not None:
+                renderer.RemoveActor(actor)
+        self.outline_filter_l = None
+        self.outline_filter_r = None
+        self.outline_mapper_l = None
+        self.outline_mapper_r = None
+        self.outline_actor_l = None
+        self.outline_actor_r = None
+
+    def _install_rotational_outline_actors(self):
+        self._remove_rotational_outline_actors()
+        if not hasattr(vtk, "vtkPolyDataSilhouette"):
+            return
+        if self.grid_l is None or self.grid_r is None:
+            return
+        camera = self.ren_l.GetActiveCamera()
+        left_grid = self.rotational_side_grid_l if self.rotational_side_grid_l is not None else self.grid_l
+        right_grid = self.rotational_side_grid_r if self.rotational_side_grid_r is not None else self.grid_r
+        self.outline_filter_l = vtk.vtkPolyDataSilhouette()
+        self.outline_filter_r = vtk.vtkPolyDataSilhouette()
+        self.outline_mapper_l = vtk.vtkPolyDataMapper()
+        self.outline_mapper_r = vtk.vtkPolyDataMapper()
+        self.outline_actor_l = vtk.vtkActor()
+        self.outline_actor_r = vtk.vtkActor()
+        for silhouette, mapper, actor, grid, renderer in (
+            (self.outline_filter_l, self.outline_mapper_l, self.outline_actor_l, left_grid, self.ren_l),
+            (self.outline_filter_r, self.outline_mapper_r, self.outline_actor_r, right_grid, self.ren_r),
+        ):
+            silhouette.SetInputData(grid)
+            silhouette.SetCamera(camera)
+            mapper.SetInputConnection(silhouette.GetOutputPort())
+            mapper.ScalarVisibilityOff()
+            actor.SetMapper(mapper)
+            actor.SetPickable(False)
+            actor.SetVisibility(False)
+            renderer.AddActor(actor)
+        self._apply_outline_actor_style()
+        self._update_rotational_outline_visibility()
 
     def _remove_cap_actors(self):
         for renderer, actor in (
@@ -3437,6 +3998,7 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
             mapper.SetColorModeToMapScalars()
             actor.SetMapper(mapper)
             actor.SetPickable(False)
+            actor.GetProperty().SetColor(*self._mesh_surface_color_for_grid_mode())
             actor.GetProperty().SetOpacity(1.0)
             renderer.AddActor(actor)
 
@@ -3487,8 +4049,10 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         if np.isclose(angle_degrees, 0.0):
             self.restore_2d_mesh()
             return
+        if self.is_mirrored_surface or self.is_arrayed_surface:
+            self.restore_2d_mesh()
         try:
-            surface_l, cap_surface_l, source_indices = build_rotational_surface(
+            surface_l, cap_surface_l, side_surface_l, source_indices = build_rotational_surface(
                 self.node_ids,
                 self.coords,
                 self.elements,
@@ -3500,24 +4064,399 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
             surface_r.DeepCopy(surface_l)
             cap_surface_r = vtk.vtkPolyData()
             cap_surface_r.DeepCopy(cap_surface_l)
+            side_surface_r = vtk.vtkPolyData()
+            side_surface_r.DeepCopy(side_surface_l)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "旋转失败", str(exc))
             return
 
         self.grid_l = surface_l
         self.grid_r = surface_r
+        self.rotational_side_grid_l = side_surface_l
+        self.rotational_side_grid_r = side_surface_r
         self.display_source_indices_l = source_indices
         self.display_source_indices_r = source_indices.copy()
         self.mapper_l.SetInputData(self.grid_l)
         self.mapper_r.SetInputData(self.grid_r)
         self._install_cap_actors(cap_surface_l, cap_surface_r)
-        if hasattr(self, "wire_mapper_l"):
-            self.wire_mapper_l.SetInputData(build_mesh_edge_polydata(self.grid_l))
-        if hasattr(self, "wire_mapper_r"):
-            self.wire_mapper_r.SetInputData(build_mesh_edge_polydata(self.grid_r))
         self.is_rotational_surface = True
+        self._install_rotational_outline_actors()
         self._apply_rotational_surface_opacity()
+        self._mark_wireframe_dirty()
+        self.set_grid_display_mode("off")
         self.restore_2d_action.setEnabled(True)
+        self.ren_l.ResetCamera()
+        self.update_both_views()
+
+    def apply_axis_mirror(self, axis_index, plane_offset):
+        normal = np.zeros(3, dtype=float)
+        normal[int(axis_index)] = 1.0
+        point = np.zeros(3, dtype=float)
+        point[int(axis_index)] = float(plane_offset)
+        self.apply_mirror_surface(normal, point)
+
+    def open_mirror_dialog(self):
+        if self.node_ids is None or self.coords is None or self.elements is None:
+            QtWidgets.QMessageBox.warning(self, "\u8b66\u544a", "\u8bf7\u5148\u52a0\u8f7d INP \u7f51\u683c\u3002")
+            return
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("\u81ea\u5b9a\u4e49\u955c\u50cf\u9762")
+        layout = QtWidgets.QVBoxLayout(dialog)
+
+        mode_combo = QtWidgets.QComboBox(dialog)
+        mode_combo.addItem("\u5750\u6807\u8f74\u5e73\u9762", "axis")
+        mode_combo.addItem("\u5e73\u9762\u4e0a\u4e00\u70b9 + \u6cd5\u5411\u91cf", "general")
+        form = QtWidgets.QFormLayout()
+        form.addRow("\u955c\u50cf\u9762\u7c7b\u578b\uff1a", mode_combo)
+
+        axis_combo = QtWidgets.QComboBox(dialog)
+        axis_combo.addItems(["X", "Y", "Z"])
+        axis_position = QtWidgets.QDoubleSpinBox(dialog)
+        axis_position.setRange(-1.0e12, 1.0e12)
+        axis_position.setDecimals(6)
+        axis_position.setSingleStep(1.0)
+        coords_3d = _coords_3d(self.coords)
+        axis_position.setValue(float((coords_3d[:, 0].min() + coords_3d[:, 0].max()) / 2.0))
+        form.addRow("\u6cd5\u5411\u8f74\uff1a", axis_combo)
+        form.addRow("\u5e73\u9762\u4f4d\u7f6e\uff1a", axis_position)
+
+        point_inputs = []
+        normal_inputs = []
+        point_defaults = coords_3d.mean(axis=0)
+        for label, default in zip(("Px\uff1a", "Py\uff1a", "Pz\uff1a"), point_defaults):
+            spin = QtWidgets.QDoubleSpinBox(dialog)
+            spin.setRange(-1.0e12, 1.0e12)
+            spin.setDecimals(6)
+            spin.setSingleStep(1.0)
+            spin.setValue(float(default))
+            form.addRow(label, spin)
+            point_inputs.append(spin)
+        for label, default in zip(("nx\uff1a", "ny\uff1a", "nz\uff1a"), (1.0, 0.0, 0.0)):
+            spin = QtWidgets.QDoubleSpinBox(dialog)
+            spin.setRange(-1.0e6, 1.0e6)
+            spin.setDecimals(6)
+            spin.setSingleStep(0.1)
+            spin.setValue(float(default))
+            form.addRow(label, spin)
+            normal_inputs.append(spin)
+
+        def update_axis_position():
+            axis = axis_combo.currentIndex()
+            axis_position.setValue(float((coords_3d[:, axis].min() + coords_3d[:, axis].max()) / 2.0))
+
+        def update_mode_visibility():
+            axis_mode = mode_combo.currentData() == "axis"
+            axis_combo.setEnabled(axis_mode)
+            axis_position.setEnabled(axis_mode)
+            for spin in point_inputs + normal_inputs:
+                spin.setEnabled(not axis_mode)
+
+        axis_combo.currentIndexChanged.connect(update_axis_position)
+        mode_combo.currentIndexChanged.connect(update_mode_visibility)
+        update_mode_visibility()
+
+        layout.addLayout(form)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            parent=dialog,
+        )
+        buttons.button(QtWidgets.QDialogButtonBox.Ok).setText("\u786e\u5b9a")
+        buttons.button(QtWidgets.QDialogButtonBox.Cancel).setText("\u53d6\u6d88")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        if mode_combo.currentData() == "axis":
+            self.apply_axis_mirror(axis_combo.currentIndex(), axis_position.value())
+        else:
+            point = np.array([spin.value() for spin in point_inputs], dtype=float)
+            normal = np.array([spin.value() for spin in normal_inputs], dtype=float)
+            self.apply_mirror_surface(normal, point)
+
+    def apply_mirror_surface(self, normal, point_on_plane):
+        if self.node_ids is None or self.coords is None or self.elements is None:
+            QtWidgets.QMessageBox.warning(self, "\u8b66\u544a", "\u8bf7\u5148\u52a0\u8f7d INP \u7f51\u683c\u3002")
+            return
+        if self.is_rotational_surface or self.is_arrayed_surface:
+            self.restore_2d_mesh()
+        try:
+            mirrored_grid_l, source_indices = build_mirrored_grid(
+                self.node_ids, self.coords, self.elements, normal, point_on_plane
+            )
+            mirrored_grid_r = vtk.vtkUnstructuredGrid()
+            mirrored_grid_r.DeepCopy(mirrored_grid_l)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "\u955c\u50cf\u5931\u8d25", str(exc))
+            return
+
+        self.grid_l = mirrored_grid_l
+        self.grid_r = mirrored_grid_r
+        self.display_source_indices_l = source_indices
+        self.display_source_indices_r = source_indices.copy()
+        self.is_rotational_surface = False
+        self.is_mirrored_surface = True
+        self.is_arrayed_surface = False
+        self.rotational_side_grid_l = None
+        self.rotational_side_grid_r = None
+        self._remove_cap_actors()
+        self._remove_rotational_outline_actors()
+        self.mapper_l.SetInputData(self.grid_l)
+        self.mapper_r.SetInputData(self.grid_r)
+        self._apply_rotational_surface_opacity()
+        self._mark_wireframe_dirty()
+        self.set_grid_display_mode("off")
+        self.restore_2d_action.setEnabled(False)
+        self.restore_mirror_action.setEnabled(True)
+        if hasattr(self, "restore_array_action"):
+            self.restore_array_action.setEnabled(False)
+        self.ren_l.ResetCamera()
+        self.update_both_views()
+
+    def apply_axis_array(
+        self, axis_index, count=36, single_angle_degrees=10.0, origin=None, axial_shift=0.0
+    ):
+        axis = np.zeros(3, dtype=float)
+        axis[int(axis_index)] = 1.0
+        if origin is None:
+            origin = np.zeros(3, dtype=float)
+        total_angle_degrees = float(count) * float(single_angle_degrees)
+        self.apply_array_surface(axis, origin, count, total_angle_degrees, axial_shift=axial_shift)
+
+    def _estimate_array_sector_angle(self, axis_index, origin):
+        if self.coords is None:
+            return None
+        coords = _coords_3d(self.coords)
+        origin = np.asarray(origin, dtype=float).reshape(3)
+        axis_index = int(axis_index)
+        plane_axes = {
+            0: (1, 2),
+            1: (2, 0),
+            2: (0, 1),
+        }[axis_index]
+        projected = coords[:, plane_axes] - origin[list(plane_axes)]
+        radii = np.linalg.norm(projected, axis=1)
+        scale = max(float(np.max(radii)) if radii.size else 0.0, 1.0)
+        valid = radii > scale * 1.0e-8
+        if np.count_nonzero(valid) < 2:
+            return None
+        angles = np.mod(np.arctan2(projected[valid, 1], projected[valid, 0]), 2.0 * np.pi)
+        angles.sort()
+        if angles.size < 2:
+            return None
+        gaps = np.diff(np.concatenate([angles, angles[:1] + 2.0 * np.pi]))
+        sector = 2.0 * np.pi - float(np.max(gaps))
+        estimate = np.rad2deg(sector)
+        if not np.isfinite(estimate):
+            return None
+        return max(0.0, min(360.0, float(estimate)))
+
+    def open_array_dialog(self, initial_axis_index=None):
+        if self.node_ids is None or self.coords is None or self.elements is None:
+            QtWidgets.QMessageBox.warning(self, "\u8b66\u544a", "\u8bf7\u5148\u52a0\u8f7d INP \u7f51\u683c\u3002")
+            return
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("\u9635\u5217\u5b9e\u4f53\u8bbe\u7f6e")
+        layout = QtWidgets.QVBoxLayout(dialog)
+        form = QtWidgets.QFormLayout()
+
+        axis_combo = QtWidgets.QComboBox(dialog)
+        axis_combo.addItems(["X", "Y", "Z"])
+        if initial_axis_index is not None:
+            axis_combo.setCurrentIndex(int(initial_axis_index))
+        form.addRow("\u9635\u5217\u8f74\uff1a", axis_combo)
+
+        origin_inputs = []
+        for label, default in zip(("Ox\uff1a", "Oy\uff1a", "Oz\uff1a"), (0.0, 0.0, 0.0)):
+            spin = QtWidgets.QDoubleSpinBox(dialog)
+            spin.setRange(-1.0e12, 1.0e12)
+            spin.setDecimals(6)
+            spin.setSingleStep(1.0)
+            spin.setValue(float(default))
+            form.addRow(label, spin)
+            origin_inputs.append(spin)
+
+        axial_shift_spin = QtWidgets.QDoubleSpinBox(dialog)
+        axial_shift_spin.setRange(-1.0e12, 1.0e12)
+        axial_shift_spin.setDecimals(6)
+        axial_shift_spin.setSingleStep(1.0)
+        axial_shift_spin.setValue(0.0)
+        form.addRow("\u8f74\u5411\u5e73\u79fb\u8ddd\u79bb\uff1a", axial_shift_spin)
+
+        count_spin = QtWidgets.QSpinBox(dialog)
+        count_spin.setRange(1, 720)
+        count_spin.setValue(36)
+        form.addRow("\u9635\u5217\u6570\u91cf\uff1a", count_spin)
+
+        single_angle_spin = QtWidgets.QDoubleSpinBox(dialog)
+        single_angle_spin.setRange(-3600.0, 3600.0)
+        single_angle_spin.setDecimals(6)
+        single_angle_spin.setSingleStep(1.0)
+        single_angle_spin.setSuffix("\u00b0")
+        single_angle_spin.setValue(10.0)
+        form.addRow("\u5355\u4efd\u5939\u89d2\uff1a", single_angle_spin)
+
+        total_angle_label = QtWidgets.QLabel(dialog)
+        form.addRow("\u603b\u89d2\u5ea6\uff1a", total_angle_label)
+
+        estimate_label = QtWidgets.QLabel("--", dialog)
+        estimate_label.setWordWrap(True)
+        form.addRow("\u4f30\u7b97\u5939\u89d2\uff1a", estimate_label)
+
+        estimate_button = QtWidgets.QPushButton("\u4f30\u7b97\u5f53\u524d\u6a21\u578b\u5939\u89d2", dialog)
+        use_estimate_button = QtWidgets.QPushButton("\u4f7f\u7528\u4f30\u7b97\u5939\u89d2", dialog)
+        use_estimate_button.setEnabled(False)
+        estimate_row = QtWidgets.QHBoxLayout()
+        estimate_row.addWidget(estimate_button)
+        estimate_row.addWidget(use_estimate_button)
+        form.addRow(estimate_row)
+
+        size_label = QtWidgets.QLabel(dialog)
+        size_label.setWordWrap(True)
+        form.addRow("\u89c4\u6a21\u9884\u4f30\uff1a", size_label)
+
+        state = {"estimated_angle": None}
+        try:
+            preview_surface, _preview_source = extract_surface_with_source_indices(
+                build_unstructured_grid(self.node_ids, self.coords, self.elements)
+            )
+            preview_point_count = preview_surface.GetNumberOfPoints()
+            preview_cell_count = preview_surface.GetNumberOfCells()
+        except Exception:
+            preview_point_count = len(self.node_ids)
+            preview_cell_count = len(self.elements) if self.elements is not None else 0
+
+        def current_origin():
+            return np.array([spin.value() for spin in origin_inputs], dtype=float)
+
+        def update_summary():
+            total_angle = count_spin.value() * single_angle_spin.value()
+            total_angle_label.setText(f"{total_angle:.6f}\u00b0")
+            point_count = preview_point_count * count_spin.value()
+            cell_count = preview_cell_count * count_spin.value()
+            size_label.setText(
+                f"\u9884\u8ba1\u5916\u8868\u9762\u663e\u793a\u70b9\u6570\uff1a{point_count}\uff1b"
+                f"\u9884\u8ba1\u5916\u8868\u9762\u5355\u5143\u6570\uff1a{cell_count}"
+            )
+
+        def estimate_angle():
+            estimated = self._estimate_array_sector_angle(axis_combo.currentIndex(), current_origin())
+            state["estimated_angle"] = estimated
+            if estimated is None:
+                estimate_label.setText("\u65e0\u6cd5\u4f30\u7b97\uff1a\u8bf7\u68c0\u67e5\u9635\u5217\u8f74\u548c\u4e2d\u5fc3\u70b9\u3002")
+                use_estimate_button.setEnabled(False)
+            else:
+                estimate_label.setText(f"\u7ea6 {estimated:.6f}\u00b0\uff08\u4ec5\u4f9b\u53c2\u8003\uff09")
+                use_estimate_button.setEnabled(True)
+
+        def use_estimate():
+            estimated = state.get("estimated_angle")
+            if estimated is not None:
+                single_angle_spin.setValue(float(estimated))
+
+        count_spin.valueChanged.connect(update_summary)
+        single_angle_spin.valueChanged.connect(update_summary)
+        axis_combo.currentIndexChanged.connect(lambda _index: estimate_angle())
+        for spin in origin_inputs:
+            spin.valueChanged.connect(lambda _value: estimate_angle())
+        estimate_button.clicked.connect(estimate_angle)
+        use_estimate_button.clicked.connect(use_estimate)
+        update_summary()
+        estimate_angle()
+
+        layout.addLayout(form)
+        note = QtWidgets.QLabel(
+            "\u8bf4\u660e\uff1a\u603b\u89d2\u5ea6 = \u9635\u5217\u6570\u91cf \u00d7 \u5355\u4efd\u5939\u89d2\u3002"
+            "\u4f30\u7b97\u5939\u89d2\u4ec5\u4f9b\u53c2\u8003\uff0c\u8bf7\u7ed3\u5408\u6a21\u578b\u5b9e\u9645\u5bf9\u79f0\u89d2\u786e\u8ba4\u3002",
+            dialog,
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            parent=dialog,
+        )
+        buttons.button(QtWidgets.QDialogButtonBox.Ok).setText("\u786e\u5b9a")
+        buttons.button(QtWidgets.QDialogButtonBox.Cancel).setText("\u53d6\u6d88")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        self.apply_axis_array(
+            axis_combo.currentIndex(),
+            count=count_spin.value(),
+            single_angle_degrees=single_angle_spin.value(),
+            origin=current_origin(),
+            axial_shift=axial_shift_spin.value(),
+        )
+
+    def apply_array_surface(self, axis, origin, count, total_angle_degrees, axial_shift=0.0):
+        if self.node_ids is None or self.coords is None or self.elements is None:
+            QtWidgets.QMessageBox.warning(self, "\u8b66\u544a", "\u8bf7\u5148\u52a0\u8f7d INP \u7f51\u683c\u3002")
+            return
+        try:
+            preview_surface, _preview_source = extract_surface_with_source_indices(
+                build_unstructured_grid(self.node_ids, self.coords, self.elements)
+            )
+            point_count = preview_surface.GetNumberOfPoints() * int(count)
+            cell_count = preview_surface.GetNumberOfCells() * int(count)
+        except Exception:
+            point_count = len(self.node_ids) * int(count)
+            cell_count = len(self.elements) * int(count) if self.elements is not None else 0
+        if point_count > 2_000_000:
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                "\u89c4\u6a21\u8f83\u5927",
+                f"\u9635\u5217\u540e\u9884\u8ba1\u5916\u8868\u9762\u663e\u793a\u70b9\u6570\u4e3a {point_count}\uff0c"
+                f"\u5916\u8868\u9762\u5355\u5143\u6570\u4e3a {cell_count}\uff0c\u53ef\u80fd\u5bfc\u81f4\u5361\u987f\u3002\u662f\u5426\u7ee7\u7eed\uff1f",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if reply != QtWidgets.QMessageBox.Yes:
+                return
+        if self.is_rotational_surface or self.is_mirrored_surface:
+            self.restore_2d_mesh()
+        try:
+            arrayed_grid_l, source_indices = build_arrayed_surface_grid(
+                self.node_ids,
+                self.coords,
+                self.elements,
+                axis,
+                origin,
+                count,
+                total_angle_degrees,
+                axial_shift=axial_shift,
+            )
+            arrayed_grid_r = vtk.vtkPolyData()
+            arrayed_grid_r.DeepCopy(arrayed_grid_l)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "\u9635\u5217\u5931\u8d25", str(exc))
+            return
+
+        self.grid_l = arrayed_grid_l
+        self.grid_r = arrayed_grid_r
+        self.display_source_indices_l = source_indices
+        self.display_source_indices_r = source_indices.copy()
+        self.is_rotational_surface = False
+        self.is_mirrored_surface = False
+        self.is_arrayed_surface = True
+        self.rotational_side_grid_l = None
+        self.rotational_side_grid_r = None
+        self._remove_cap_actors()
+        self._remove_rotational_outline_actors()
+        self.mapper_l.SetInputData(self.grid_l)
+        self.mapper_r.SetInputData(self.grid_r)
+        self._apply_rotational_surface_opacity()
+        self._mark_wireframe_dirty()
+        self.set_grid_display_mode("off")
+        self.restore_2d_action.setEnabled(False)
+        if hasattr(self, "restore_mirror_action"):
+            self.restore_mirror_action.setEnabled(False)
+        self.restore_array_action.setEnabled(True)
         self.ren_l.ResetCamera()
         self.update_both_views()
 
@@ -3530,16 +4469,23 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         self.display_source_indices_l = identity
         self.display_source_indices_r = identity.copy()
         self.is_rotational_surface = False
+        self.is_mirrored_surface = False
+        self.is_arrayed_surface = False
+        self.rotational_side_grid_l = None
+        self.rotational_side_grid_r = None
         self._remove_cap_actors()
+        self._remove_rotational_outline_actors()
         self.mapper_l.SetInputData(self.grid_l)
         self.mapper_r.SetInputData(self.grid_r)
-        if hasattr(self, "wire_mapper_l"):
-            self.wire_mapper_l.SetInputData(build_mesh_edge_polydata(self.grid_l))
-        if hasattr(self, "wire_mapper_r"):
-            self.wire_mapper_r.SetInputData(build_mesh_edge_polydata(self.grid_r))
         self.is_rotational_surface = False
         self._apply_rotational_surface_opacity()
+        self._mark_wireframe_dirty()
+        self._apply_grid_display_mode()
         self.restore_2d_action.setEnabled(False)
+        if hasattr(self, "restore_mirror_action"):
+            self.restore_mirror_action.setEnabled(False)
+        if hasattr(self, "restore_array_action"):
+            self.restore_array_action.setEnabled(False)
         self.ren_l.ResetCamera()
         self.update_both_views()
 
@@ -3566,12 +4512,11 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
             self._set_solid_background(self.ren_l, color)
             self._set_solid_background(self.ren_r, color)
         self._apply_scalarbar_text_style()
-        text_color, _use_shadow = self._get_scalarbar_text_style(style)
-        wire_color = (0.75, 0.77, 0.80) if text_color[0] > 0.5 else (0.25, 0.27, 0.30)
-        for actor in (getattr(self, "wire_actor_l", None), getattr(self, "wire_actor_r", None)):
-            if actor is not None:
-                actor.GetProperty().SetColor(*wire_color)
-        self.safe_render_both()
+        if getattr(self, "current_field", "") in getattr(self, "fields", {}):
+            self.update_both_views()
+        else:
+            self._update_wire_color_for_current_view()
+            self.safe_render_both()
 
     def _set_abaqus_background(self, renderer):
         renderer.GradientBackgroundOn()
@@ -3631,6 +4576,7 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         ):
             return
         self.colormap_style = style
+        self._lookup_table_cache_key = None
         self._apply_colormap_style(style)
 
     def _apply_colormap_style(self, style):
@@ -3714,6 +4660,7 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         
         self.stop_play() 
         self._field_data_epoch += 1
+        self._lookup_table_cache_key = None
         for task in list(self._background_tasks):
             try:
                 task["discarded"] = True
@@ -3751,6 +4698,7 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         self.frame_label.setText("帧: 0/0")
 
         self._remove_cap_actors()
+        self._remove_rotational_outline_actors()
         self.ren_l.RemoveAllViewProps()
         self.ren_r.RemoveAllViewProps()
         self.marker_ren_l.RemoveAllViewProps()
@@ -3762,6 +4710,10 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         self.display_source_indices_l = identity
         self.display_source_indices_r = identity.copy()
         self.is_rotational_surface = False
+        self.is_mirrored_surface = False
+        self.is_arrayed_surface = False
+        self.rotational_side_grid_l = None
+        self.rotational_side_grid_r = None
         self._apply_rotational_surface_opacity()
 
         self.mapper_l, self.actor_l, self.scalarbar_l = make_mapper_actor_scalarbar(
@@ -3780,7 +4732,8 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         self.wire_mapper_r, self.wire_actor_r = make_wireframe_actor(self.grid_r)
         self.ren_r.AddActor(self.wire_actor_r)
         self.ren_r.AddViewProp(self.scalarbar_r)  
-        self.set_grid_visibility(self.grid_visible)
+        self._wireframe_dirty = False
+        self._apply_grid_display_mode()
 
         self._apply_background_style(self.background_style)
 
@@ -3788,14 +4741,23 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         self.ren_l.ResetCamera()
         self.safe_render_both()
 
-        # 还没加载 CSV，控件先禁用
+        # 还没加载物理场文件，控件先禁用
         self.set_controls_enabled(False)
         for action in self.rotation_actions:
             action.setEnabled(True)
         self.restore_2d_action.setEnabled(False)
+        for action in getattr(self, "mirror_actions", []):
+            action.setEnabled(True)
+        if hasattr(self, "restore_mirror_action"):
+            self.restore_mirror_action.setEnabled(False)
+        for action in getattr(self, "array_actions", []):
+            action.setEnabled(True)
+        if hasattr(self, "restore_array_action"):
+            self.restore_array_action.setEnabled(False)
 
     def clear_physical_fields(self):
         self._field_data_epoch += 1
+        self._lookup_table_cache_key = None
         self.stop_play()
 
         for task in list(self._background_tasks):
@@ -3849,6 +4811,7 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
             self.scalarbar_l.SetTitle("FOM")
         if hasattr(self, "scalarbar_r"):
             self.scalarbar_r.SetTitle("ROM")
+        self._update_wire_color_for_current_view()
 
         self.clear_extreme_markers()
         if self.node_query_dialog is not None:
@@ -3882,7 +4845,12 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "警告", "请先加载 INP")
             return
 
-        paths, _ = QFileDialog.getOpenFileNames(self, "加载高保真 CSV", "", "CSV Files (*.csv)") 
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "加载高保真物理场文件",
+            "",
+            "Field Files (*.csv *.npy);;CSV Files (*.csv);;NumPy Files (*.npy)",
+        )
         if not paths:
             return
         self._load_csv_async("left", paths)
@@ -3892,7 +4860,12 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "警告", "请先加载 INP") 
             return
 
-        paths, _ = QFileDialog.getOpenFileNames(self, "加载降阶 CSV", "", "CSV Files (*.csv)") 
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "加载降阶物理场文件",
+            "",
+            "Field Files (*.csv *.npy);;CSV Files (*.csv);;NumPy Files (*.npy)",
+        )
         if not paths:
             return
         self._load_csv_async("right", paths)
@@ -3905,6 +4878,7 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         def apply_results(results, errors, cancelled):
             if task_epoch != self._field_data_epoch:
                 return
+            self._lookup_table_cache_key = None
             target = self.fields if side == "left" else self.rom_fields
             combo = self.combo_left if side == "left" else self.combo_right
             loaded_names = []
@@ -3940,7 +4914,7 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
                 )
             if errors:
                 details = "\n\n".join(f"{path}\n{message}" for path, message in errors)
-                QtWidgets.QMessageBox.warning(self, "部分 CSV 加载失败", details)
+                QtWidgets.QMessageBox.warning(self, "部分物理场文件加载失败", details)
 
         self._start_background_task(
             worker, f"正在加载 {side_label} 物理场", apply_results
@@ -4106,10 +5080,8 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         scalars_l.SetName(self.current_field)
         for x in v_left:
             scalars_l.InsertNextValue(float(x))
-        self.grid_l.GetPointData().SetScalars(scalars_l)
-        if self.cap_grid_l is not None:
-            self.cap_grid_l.GetPointData().SetScalars(scalars_l)
-            self.cap_grid_l.Modified()
+        self._set_dataset_point_scalars(self.grid_l, scalars_l)
+        self._set_dataset_point_scalars(self.cap_grid_l, scalars_l)
         self.scalarbar_l.SetTitle(self.current_field)
 
         rom_key = None
@@ -4130,10 +5102,8 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
             scalars_r.SetName(vtk_title)
             for x in v_right:
                 scalars_r.InsertNextValue(float(x))
-            self.grid_r.GetPointData().SetScalars(scalars_r)
-            if self.cap_grid_r is not None:
-                self.cap_grid_r.GetPointData().SetScalars(scalars_r)
-                self.cap_grid_r.Modified()
+            self._set_dataset_point_scalars(self.grid_r, scalars_r)
+            self._set_dataset_point_scalars(self.cap_grid_r, scalars_r)
             self.scalarbar_r.SetTitle(vtk_title)
             have_right = True
         elif rom_key is not None:
@@ -4148,10 +5118,8 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
             scalars_r.SetName(rom_key)
             for x in v_right:
                 scalars_r.InsertNextValue(float(x))
-            self.grid_r.GetPointData().SetScalars(scalars_r)
-            if self.cap_grid_r is not None:
-                self.cap_grid_r.GetPointData().SetScalars(scalars_r)
-                self.cap_grid_r.Modified()
+            self._set_dataset_point_scalars(self.grid_r, scalars_r)
+            self._set_dataset_point_scalars(self.cap_grid_r, scalars_r)
             have_right = True
             self.scalarbar_r.SetTitle(rom_key)
         else:
@@ -4167,15 +5135,22 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
                 v_left_source,
                 v_right_source,
             )
+            self._update_wire_color_for_current_view(
+                v_left,
+                v_right,
+                self.lut_left,
+                self.lut_right,
+                left_range,
+                right_range,
+            )
         elif have_right:
             right_min, right_max = rfield["vmin"], rfield["vmax"]
             shared_min = min(left_min, right_min)
             shared_max = max(left_max, right_max)
         else:
             shared_min, shared_max = left_min, left_max
-            self.grid_r.GetPointData().SetScalars(None)
-            if self.cap_grid_r is not None:
-                self.cap_grid_r.GetPointData().SetScalars(None)
+            self._set_dataset_point_scalars(self.grid_r, None)
+            self._set_dataset_point_scalars(self.cap_grid_r, None)
 
         if error_key is None:
             shared_min, shared_max = self._safe_scalar_range(shared_min, shared_max)
@@ -4188,6 +5163,14 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
                 self._apply_hotspot_lookup_tables(shared_min, shared_max, filter_threshold)
             else:
                 self._apply_opaque_lookup_tables(shared_min, shared_max)
+            self._update_wire_color_for_current_view(
+                v_left,
+                v_right if have_right else None,
+                self.lut_left,
+                self.lut_right if have_right else None,
+                (shared_min, shared_max),
+                (shared_min, shared_max) if have_right else None,
+            )
 
         self.scalarbar_l.SetTitle(self.current_field)
         frame_text = field["frames"][self.current_frame] if "frames" in field else str(self.current_frame)
@@ -4196,9 +5179,6 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         self.frame_label.setText(
             f"帧: {self.current_frame + 1}/{n_frames} ({frame_text}{suffix})"
         )
-
-        self.grid_l.Modified()
-        self.grid_r.Modified()
 
         if (
             self.extreme_query_dialog is not None

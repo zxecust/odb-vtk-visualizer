@@ -621,59 +621,98 @@ def build_unstructured_grid(node_ids, coords, elements):
     return grid
 
 
-def _mirrored_element_node_order(nodes, elem_type):
-    nodes = list(nodes)
-    et = (elem_type or "").upper()
-    n = len(nodes)
-    if n == 3:
-        return [nodes[index] for index in (0, 2, 1)]
-    if n == 4:
-        if et.startswith("C3D4"):
-            return [nodes[index] for index in (0, 2, 1, 3)]
-        return [nodes[index] for index in (0, 3, 2, 1)]
-    if n == 6:
-        return [nodes[index] for index in (0, 2, 1, 3, 5, 4)]
-    if n == 8:
-        if et.startswith(("CPS8", "CPE8", "CAX8", "S8")):
-            return [nodes[index] for index in (0, 3, 2, 1, 7, 6, 5, 4)]
-        return [nodes[index] for index in (0, 3, 2, 1, 4, 7, 6, 5)]
-    return list(reversed(nodes))
-
-
 def build_mirrored_grid(node_ids, coords, elements, normal, point_on_plane):
-    xyz = _coords_3d(coords)
+    grid = build_unstructured_grid(node_ids, coords, elements)
+    source_indices = np.arange(len(node_ids), dtype=np.int64)
+    return mirror_unstructured_grid(grid, source_indices, normal, point_on_plane)
+
+
+def _mirrored_vtk_cell_point_order(point_ids, cell_type):
+    point_ids = list(point_ids)
+    permutations = {
+        vtk.VTK_TRIANGLE: (0, 2, 1),
+        vtk.VTK_QUAD: (0, 3, 2, 1),
+        vtk.VTK_QUADRATIC_QUAD: (0, 3, 2, 1, 7, 6, 5, 4),
+        vtk.VTK_TETRA: (0, 2, 1, 3),
+        vtk.VTK_WEDGE: (0, 2, 1, 3, 5, 4),
+        vtk.VTK_HEXAHEDRON: (0, 3, 2, 1, 4, 7, 6, 5),
+    }
+    permutation = permutations.get(int(cell_type))
+    if permutation is None or len(permutation) != len(point_ids):
+        raise ValueError(
+            f"暂不支持累积镜像 VTK 单元类型 {int(cell_type)}"
+            f"（节点数 {len(point_ids)}）。"
+        )
+    return [point_ids[index] for index in permutation]
+
+
+def mirror_unstructured_grid(grid, source_indices, normal, point_on_plane):
+    """Append a reflected copy of the current grid and preserve source-node mapping."""
+    if grid is None or grid.GetPoints() is None:
+        raise ValueError("当前显示网格为空，无法执行镜像。")
+
+    point_count = int(grid.GetNumberOfPoints())
+    if point_count == 0:
+        raise ValueError("当前显示网格没有节点，无法执行镜像。")
+
+    source_indices = np.asarray(source_indices, dtype=np.int64).ravel()
+    if source_indices.size != point_count:
+        raise ValueError(
+            "当前显示网格与源节点映射数量不一致："
+            f"显示节点={point_count}，映射节点={source_indices.size}。"
+        )
+
     normal = np.asarray(normal, dtype=float).reshape(3)
     normal_norm = float(np.linalg.norm(normal))
     if normal_norm <= 1.0e-12:
         raise ValueError("镜像面法向量不能为零。")
     normal = normal / normal_norm
     point_on_plane = np.asarray(point_on_plane, dtype=float).reshape(3)
+
+    xyz = np.asarray(
+        [grid.GetPoint(index) for index in range(point_count)], dtype=float
+    )
     signed_distances = xyz @ normal - float(point_on_plane @ normal)
     mirrored_xyz = xyz - 2.0 * signed_distances[:, None] * normal
-    combined_coords = np.vstack([xyz, mirrored_xyz])
 
-    node_count = len(node_ids)
-    mirrored_node_ids = [int(node_id) + node_count for node_id in node_ids]
-    while set(node_ids).intersection(mirrored_node_ids):
-        node_count *= 10
-        mirrored_node_ids = [int(node_id) + node_count for node_id in node_ids]
-    combined_node_ids = np.concatenate([np.asarray(node_ids), np.asarray(mirrored_node_ids)])
-    mirror_id_map = {
-        int(source_id): int(mirror_id)
-        for source_id, mirror_id in zip(node_ids, mirrored_node_ids)
-    }
-    combined_elements = list(elements)
-    for elem in elements:
-        nodes, elem_type = _unpack_element(elem)
-        mirrored_ordered_nodes = _mirrored_element_node_order(nodes, elem_type)
-        mirrored_nodes = [mirror_id_map[int(node_id)] for node_id in mirrored_ordered_nodes]
-        combined_elements.append((mirrored_nodes, elem_type))
-    grid = build_unstructured_grid(combined_node_ids, combined_coords, combined_elements)
-    source_indices = np.concatenate([
-        np.arange(len(node_ids), dtype=np.int64),
-        np.arange(len(node_ids), dtype=np.int64),
-    ])
-    return grid, source_indices
+    points = vtk.vtkPoints()
+    for point in xyz:
+        points.InsertNextPoint(*point)
+    for point in mirrored_xyz:
+        points.InsertNextPoint(*point)
+
+    output = vtk.vtkUnstructuredGrid()
+    output.SetPoints(points)
+
+    def insert_cell(cell_type, point_ids):
+        vtk_ids = vtk.vtkIdList()
+        for point_id in point_ids:
+            vtk_ids.InsertNextId(int(point_id))
+        output.InsertNextCell(int(cell_type), vtk_ids)
+
+    cells = []
+    for cell_index in range(grid.GetNumberOfCells()):
+        cell = grid.GetCell(cell_index)
+        if cell is None:
+            continue
+        cell_type = int(cell.GetCellType())
+        point_ids = [
+            int(cell.GetPointId(index))
+            for index in range(cell.GetNumberOfPoints())
+        ]
+        cells.append((cell_type, point_ids))
+        insert_cell(cell_type, point_ids)
+
+    for cell_type, point_ids in cells:
+        mirrored_order = _mirrored_vtk_cell_point_order(point_ids, cell_type)
+        insert_cell(
+            cell_type,
+            [point_count + point_id for point_id in mirrored_order],
+        )
+
+    output.BuildLinks()
+    combined_source_indices = np.concatenate([source_indices, source_indices])
+    return output, combined_source_indices
 
 
 def _coords_3d(coords):
@@ -4115,7 +4154,20 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         axis_position.setRange(-1.0e12, 1.0e12)
         axis_position.setDecimals(6)
         axis_position.setSingleStep(1.0)
-        coords_3d = _coords_3d(self.coords)
+        if (
+            self.is_mirrored_surface
+            and getattr(self, "grid_l", None) is not None
+            and self.grid_l.GetNumberOfPoints() > 0
+        ):
+            coords_3d = np.asarray(
+                [
+                    self.grid_l.GetPoint(index)
+                    for index in range(self.grid_l.GetNumberOfPoints())
+                ],
+                dtype=float,
+            )
+        else:
+            coords_3d = _coords_3d(self.coords)
         axis_position.setValue(float((coords_3d[:, 0].min() + coords_3d[:, 0].max()) / 2.0))
         form.addRow("\u6cd5\u5411\u8f74\uff1a", axis_combo)
         form.addRow("\u5e73\u9762\u4f4d\u7f6e\uff1a", axis_position)
@@ -4182,8 +4234,11 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         if self.is_rotational_surface or self.is_arrayed_surface:
             self.restore_2d_mesh()
         try:
-            mirrored_grid_l, source_indices = build_mirrored_grid(
-                self.node_ids, self.coords, self.elements, normal, point_on_plane
+            mirrored_grid_l, source_indices = mirror_unstructured_grid(
+                self.grid_l,
+                self.display_source_indices_l,
+                normal,
+                point_on_plane,
             )
             mirrored_grid_r = vtk.vtkUnstructuredGrid()
             mirrored_grid_r.DeepCopy(mirrored_grid_l)
@@ -4200,6 +4255,9 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         self.is_arrayed_surface = False
         self.rotational_side_grid_l = None
         self.rotational_side_grid_r = None
+        self._remove_extreme_actors()
+        if self.extreme_query_dialog is not None:
+            self.extreme_query_dialog.set_results([], "当前字段/帧：--")
         self._remove_cap_actors()
         self._remove_rotational_outline_actors()
         self.mapper_l.SetInputData(self.grid_l)
@@ -4213,6 +4271,12 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
             self.restore_array_action.setEnabled(False)
         self.ren_l.ResetCamera()
         self.update_both_views()
+        self.safe_render_both()
+        self.statusBar().showMessage(
+            f"累积镜像完成：{self.grid_l.GetNumberOfPoints()} 个显示节点，"
+            f"{self.grid_l.GetNumberOfCells()} 个单元。",
+            6000,
+        )
 
     def apply_axis_array(
         self, axis_index, count=36, single_angle_degrees=10.0, origin=None, axial_shift=0.0

@@ -25,6 +25,7 @@ PLANAR_TOLERANCE_FACTOR = 1.0e-8
 ABAQUS_MESH_SURFACE_RGB = (0, 210, 210)
 ABAQUS_MESH_SURFACE_COLOR = tuple(channel / 255.0 for channel in ABAQUS_MESH_SURFACE_RGB)
 DEFAULT_MESH_SURFACE_COLOR = (0.86, 0.86, 0.86)
+RELATIVE_ERROR_DISPLAY_CAP = 1.0
 FONT_REGULAR_NAME = "NotoSansCJKsc-Regular.otf"
 FONT_MEDIUM_NAME = "NotoSansCJKsc-Medium.otf"
 FONT_BOLD_NAME = "NotoSansCJKsc-Bold.otf"
@@ -79,29 +80,17 @@ def apply_vtk_font_file(text_property, filename):
     text_property.SetFontFamily(vtk.VTK_FONT_FILE)
     text_property.SetFontFile(str(path))
 
-def read_inp_nodes(inp_path):
-    node_ids, coords = [], []
-    read_flag = False
-    with open(inp_path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line = line.strip() 
-            if not line:
-                continue
-            if line.lower().startswith("*node"): 
-                read_flag = True
-                continue
-            if read_flag and line.startswith("*"):
-                break
-            if read_flag:
-                parts = [p.strip() for p in line.split(",")] 
-                if len(parts) < 3: 
-                    continue
-                try:
-                    node_ids.append(int(parts[0])) 
-                    coords.append([float(x) for x in parts[1:]]) 
-                except ValueError:
-                    continue
-    return np.array(node_ids), np.array(coords)
+_INP_MESH_CACHE = {}
+
+
+def _parse_inp_option(line, name):
+    prefix = name.lower() + "="
+    for part in line.split(","):
+        part = part.strip()
+        if part.lower().startswith(prefix):
+            return part.split("=", 1)[1].strip()
+    return None
+
 
 def _parse_element_type(line):
     parts = [p.strip() for p in line.split(",")]
@@ -111,32 +100,97 @@ def _parse_element_type(line):
     return None
 
 
-def read_inp_elements(inp_path):
-    elements = []
-    read_flag = False
+def _is_keyword(line, keyword):
+    low = line.strip().lower()
+    keyword = keyword.lower()
+    return low == keyword or low.startswith(keyword + ",")
+
+
+def _current_inp_scope(part_name, instance_name):
+    if instance_name:
+        return ("instance", instance_name)
+    if part_name:
+        return ("part", part_name)
+    return ("global", "")
+
+
+def read_inp_mesh(inp_path):
+    path_key = str(Path(inp_path).resolve())
+    cached = _INP_MESH_CACHE.get(path_key)
+    if cached is not None:
+        node_ids, coords, elements = cached
+        return node_ids.copy(), coords.copy(), list(elements)
+
+    node_ids, coords, elements = [], [], []
+    scoped_node_ids = {}
+    read_nodes = False
+    read_elements = False
     elem_type = None
+    part_name = None
+    instance_name = None
+
     with open(inp_path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("**"):
                 continue
             if line.startswith("*"):
-                if line.lower().startswith("*element"):
-                    read_flag = True
+                read_nodes = False
+                read_elements = False
+                elem_type = None
+                if _is_keyword(line, "*part"):
+                    part_name = _parse_inp_option(line, "name") or part_name
+                elif _is_keyword(line, "*end part"):
+                    part_name = None
+                elif _is_keyword(line, "*instance"):
+                    instance_name = _parse_inp_option(line, "name") or instance_name
+                elif _is_keyword(line, "*end instance"):
+                    instance_name = None
+                elif _is_keyword(line, "*node"):
+                    read_nodes = True
+                elif _is_keyword(line, "*element"):
+                    read_elements = True
                     elem_type = _parse_element_type(line)
-                else:
-                    read_flag = False
-                    elem_type = None
                 continue
-            if read_flag:
-                parts = [p.strip() for p in line.split(",")]
+
+            scope = _current_inp_scope(part_name, instance_name)
+            if read_nodes:
+                parts = [p.strip() for p in line.split(",") if p.strip()]
+                if len(parts) < 3:
+                    continue
+                try:
+                    local_id = int(parts[0])
+                    point = [float(x) for x in parts[1:]]
+                except ValueError:
+                    continue
+                synthetic_id = len(node_ids) + 1
+                scoped_node_ids[(scope, local_id)] = synthetic_id
+                node_ids.append(synthetic_id)
+                coords.append(point)
+            elif read_elements:
+                parts = [p.strip() for p in line.split(",") if p.strip()]
                 if len(parts) < 2:
                     continue
                 try:
-                    nodes = [int(x) for x in parts[1:]]
-                except ValueError:
+                    local_nodes = [int(x) for x in parts[1:]]
+                    nodes = [scoped_node_ids[(scope, node_id)] for node_id in local_nodes]
+                except (ValueError, KeyError):
                     continue
                 elements.append((nodes, elem_type))
+
+    node_ids = np.asarray(node_ids, dtype=np.int64)
+    coords = np.asarray(coords, dtype=float)
+    _INP_MESH_CACHE[path_key] = (node_ids.copy(), coords.copy(), list(elements))
+    return node_ids, coords, elements
+
+
+def read_inp_nodes(inp_path):
+    node_ids, coords, _elements = read_inp_mesh(inp_path)
+    return node_ids, coords
+
+
+def read_inp_elements(inp_path):
+    _node_ids, _coords, elements = read_inp_mesh(inp_path)
     return elements
 
 
@@ -463,6 +517,7 @@ class ErrorFieldWorker(QtCore.QObject):
                     f"正在生成{type_labels[error_type]}（{index + 1}/{total}）",
                 )
                 excluded_count = 0
+                clipped_count = 0
                 if error_type == "absolute":
                     values = absolute_error.copy()
                 elif error_type == "normalized":
@@ -480,6 +535,14 @@ class ErrorFieldWorker(QtCore.QObject):
                         where=denominator_valid,
                     )
                     excluded_count = int(values.size - np.count_nonzero(denominator_valid))
+                    finite_values = np.isfinite(values)
+                    clipped_count = int(np.count_nonzero(finite_values & (values > RELATIVE_ERROR_DISPLAY_CAP)))
+                    np.minimum(
+                        values,
+                        RELATIVE_ERROR_DISPLAY_CAP,
+                        out=values,
+                        where=finite_values,
+                    )
                 values[~pair_finite] = np.nan
                 data = np.full(fom_data.shape, np.nan, dtype=float)
                 data[fom_indices] = values
@@ -512,6 +575,7 @@ class ErrorFieldWorker(QtCore.QObject):
                         },
                         len(pairs),
                         excluded_count,
+                        clipped_count,
                         matching_note,
                         type_labels[error_type],
                     )
@@ -2149,6 +2213,7 @@ class ErrorFieldDialog(QtWidgets.QDialog):
         pair_finite = np.isfinite(reference) & np.isfinite(prediction)
         absolute_error = np.abs(prediction - reference)
         excluded_count = 0
+        clipped_count = 0
         if error_type == "absolute":
             values = absolute_error
         elif error_type == "normalized":
@@ -2165,9 +2230,17 @@ class ErrorFieldDialog(QtWidgets.QDialog):
             values = np.full_like(absolute_error, np.nan)
             np.divide(absolute_error, np.abs(reference), out=values, where=valid_denominator)
             excluded_count = int(values.size - np.count_nonzero(valid_denominator))
+            finite_values = np.isfinite(values)
+            clipped_count = int(np.count_nonzero(finite_values & (values > RELATIVE_ERROR_DISPLAY_CAP)))
+            np.minimum(
+                values,
+                RELATIVE_ERROR_DISPLAY_CAP,
+                out=values,
+                where=finite_values,
+            )
         values[~pair_finite] = np.nan
         output[fom_indices] = values
-        return output, pairs, matching_note, excluded_count
+        return output, pairs, matching_note, excluded_count, clipped_count
 
     def generate(self):
         fom_name = self.fom_combo.currentText()
@@ -3489,13 +3562,16 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
                 return
             generated_names, notes = [], []
             matching_note = ""
-            for display_name, field_data, frame_count, excluded_count, note, type_label in generated:
+            for display_name, field_data, frame_count, excluded_count, clipped_count, note, type_label in generated:
                 self.error_fields[display_name] = field_data
                 if self.combo_right.findText(display_name) < 0:
                     self.combo_right.addItem(display_name)
                 generated_names.append(display_name)
                 matching_note = note
-                notes.append(f"{type_label}：{frame_count} 帧，排除 {excluded_count} 个零基准值")
+                note_text = f"{type_label}：{frame_count} 帧，排除 {excluded_count} 个零基准值"
+                if field_data.get("error_type") == "relative":
+                    note_text += f"，截断 {clipped_count} 个超过 100% 的值"
+                notes.append(note_text)
             if generated_names:
                 self.combo_left.setCurrentText(fom_name)
                 self.combo_right.setCurrentText(generated_names[-1])
@@ -4733,10 +4809,12 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-        self.node_ids, self.coords = read_inp_nodes(path)
-        self.elements = read_inp_elements(path)
+        self.node_ids, self.coords, self.elements = read_inp_mesh(path)
         if self.coords is None or len(self.coords) == 0:
             QtWidgets.QMessageBox.warning(self, "警告", "INP 未读取到节点！")
+            return
+        if not self.elements:
+            QtWidgets.QMessageBox.warning(self, "警告", "INP 未读取到可支持的单元！")
             return
 
         self.fields.clear()

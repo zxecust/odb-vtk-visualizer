@@ -81,6 +81,8 @@ def apply_vtk_font_file(text_property, filename):
     text_property.SetFontFile(str(path))
 
 _INP_MESH_CACHE = {}
+_LAST_INP_READ_REPORT = {}
+_LAST_GRID_BUILD_REPORT = {}
 
 
 def _parse_inp_option(line, name):
@@ -106,81 +108,367 @@ def _is_keyword(line, keyword):
     return low == keyword or low.startswith(keyword + ",")
 
 
-def _current_inp_scope(part_name, instance_name):
-    if instance_name:
-        return ("instance", instance_name)
-    if part_name:
-        return ("part", part_name)
-    return ("global", "")
+def _inp_file_signature(path):
+    stat = Path(path).stat()
+    return int(stat.st_mtime_ns), int(stat.st_size)
+
+
+def _iter_inp_lines(inp_path, include_stack=None, source_signatures=None):
+    """Yield INP lines while expanding Abaqus *Include files recursively."""
+    path = Path(inp_path).resolve()
+    include_stack = [] if include_stack is None else include_stack
+    source_signatures = {} if source_signatures is None else source_signatures
+    path_key = str(path)
+    if path_key in include_stack:
+        chain = " -> ".join(include_stack + [path_key])
+        raise ValueError(f"INP Include 存在循环引用：{chain}")
+    if not path.is_file():
+        raise FileNotFoundError(f"找不到 INP 或 Include 文件：{path}")
+
+    include_stack.append(path_key)
+    source_signatures[path_key] = _inp_file_signature(path)
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="ignore") as stream:
+            for raw_line in stream:
+                stripped = raw_line.strip()
+                if _is_keyword(stripped, "*include"):
+                    include_name = _parse_inp_option(stripped, "input")
+                    if include_name is None:
+                        include_name = _parse_inp_option(stripped, "file")
+                    if not include_name:
+                        raise ValueError(f"Include 未指定文件：{path}")
+                    include_name = include_name.strip().strip("\"'")
+                    include_path = Path(include_name)
+                    if not include_path.is_absolute():
+                        include_path = path.parent / include_path
+                    yield from _iter_inp_lines(
+                        include_path, include_stack, source_signatures
+                    )
+                else:
+                    yield raw_line.rstrip("\r\n")
+    finally:
+        include_stack.pop()
+
+
+def _new_inp_mesh_definition():
+    return {"nodes": {}, "elements": []}
+
+
+def _expected_element_node_count(elem_type):
+    elem_type = (elem_type or "").upper().replace(" ", "")
+    if not elem_type:
+        return None
+    if elem_type.startswith(("MASS", "ROTARYI")):
+        return 1
+    beam_match = re.match(r"^(?:B|PIPE|FRAME)(?:2|3)([123])", elem_type)
+    if beam_match:
+        return {"1": 2, "2": 3, "3": 4}[beam_match.group(1)]
+    truss_match = re.match(r"^T[23]D([23])", elem_type)
+    if truss_match:
+        return int(truss_match.group(1))
+    connector_match = re.match(r"^CONN[23]D2", elem_type)
+    if connector_match:
+        return 2
+
+    family_patterns = (
+        r"^(?:C|DC|AC|COH|CIN)?3D(\d+)",
+        r"^(?:CPE|CPS|CAX|CGAX|DC2D|SAX|M3D|R3D|STRI|S|SC)(\d+)",
+    )
+    for pattern in family_patterns:
+        match = re.match(pattern, elem_type)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _instance_transform_points(points, translation, rotations):
+    transformed = np.asarray(points, dtype=float).copy()
+    if transformed.size == 0:
+        return transformed.reshape((-1, 3))
+    transformed += np.asarray(translation, dtype=float).reshape(1, 3)
+    for axis_start, axis_end, angle_degrees in rotations:
+        axis_start = np.asarray(axis_start, dtype=float)
+        axis = np.asarray(axis_end, dtype=float) - axis_start
+        axis_norm = float(np.linalg.norm(axis))
+        if axis_norm <= 1.0e-14:
+            raise ValueError("Instance 旋转轴的两个定义点不能重合。")
+        axis /= axis_norm
+        angle = np.deg2rad(float(angle_degrees))
+        cross_matrix = np.array(
+            (
+                (0.0, -axis[2], axis[1]),
+                (axis[2], 0.0, -axis[0]),
+                (-axis[1], axis[0], 0.0),
+            ),
+            dtype=float,
+        )
+        rotation = (
+            np.eye(3) * np.cos(angle)
+            + (1.0 - np.cos(angle)) * np.outer(axis, axis)
+            + np.sin(angle) * cross_matrix
+        )
+        transformed = (transformed - axis_start) @ rotation.T + axis_start
+    return transformed
 
 
 def read_inp_mesh(inp_path):
+    """Read a flat mesh or expand an Abaqus Part/Assembly model for display."""
+    global _LAST_INP_READ_REPORT
     path_key = str(Path(inp_path).resolve())
     cached = _INP_MESH_CACHE.get(path_key)
     if cached is not None:
-        node_ids, coords, elements = cached
-        return node_ids.copy(), coords.copy(), list(elements)
+        signatures, node_ids, coords, elements, report = cached
+        try:
+            cache_valid = all(
+                _inp_file_signature(path) == signature
+                for path, signature in signatures.items()
+            )
+        except OSError:
+            cache_valid = False
+        if cache_valid:
+            _LAST_INP_READ_REPORT = dict(report)
+            return node_ids.copy(), coords.copy(), list(elements)
 
-    node_ids, coords, elements = [], [], []
-    scoped_node_ids = {}
-    read_nodes = False
-    read_elements = False
+    parts = {}
+    part_names = {}
+    global_mesh = _new_inp_mesh_definition()
+    assembly_mesh = _new_inp_mesh_definition()
+    instances = []
+    source_signatures = {}
+    current_part = None
+    current_instance = None
+    in_assembly = False
+    assembly_present = False
+    mode = None
+    current_mesh = None
     elem_type = None
-    part_name = None
-    instance_name = None
+    pending_element = None
+    malformed_elements = 0
 
-    with open(inp_path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("**"):
-                continue
-            if line.startswith("*"):
-                read_nodes = False
-                read_elements = False
-                elem_type = None
-                if _is_keyword(line, "*part"):
-                    part_name = _parse_inp_option(line, "name") or part_name
-                elif _is_keyword(line, "*end part"):
-                    part_name = None
-                elif _is_keyword(line, "*instance"):
-                    instance_name = _parse_inp_option(line, "name") or instance_name
-                elif _is_keyword(line, "*end instance"):
-                    instance_name = None
-                elif _is_keyword(line, "*node"):
-                    read_nodes = True
-                elif _is_keyword(line, "*element"):
-                    read_elements = True
-                    elem_type = _parse_element_type(line)
-                continue
+    def flush_pending_element():
+        nonlocal pending_element, malformed_elements
+        if pending_element is None:
+            return
+        expected = _expected_element_node_count(pending_element["type"])
+        connectivity = pending_element["nodes"]
+        if connectivity and (expected is None or len(connectivity) >= expected):
+            if expected is not None:
+                connectivity = connectivity[:expected]
+            pending_element["mesh"]["elements"].append(
+                (connectivity, pending_element["type"])
+            )
+        else:
+            malformed_elements += 1
+        pending_element = None
 
-            scope = _current_inp_scope(part_name, instance_name)
-            if read_nodes:
-                parts = [p.strip() for p in line.split(",") if p.strip()]
-                if len(parts) < 3:
+    for raw_line in _iter_inp_lines(inp_path, source_signatures=source_signatures):
+        line = raw_line.strip()
+        if not line or line.startswith("**"):
+            continue
+        if line.startswith("*"):
+            flush_pending_element()
+            mode = None
+            current_mesh = None
+            elem_type = None
+            if _is_keyword(line, "*part"):
+                name = _parse_inp_option(line, "name") or f"Part-{len(parts) + 1}"
+                current_part = name
+                parts.setdefault(name, _new_inp_mesh_definition())
+                part_names[name.lower()] = name
+            elif _is_keyword(line, "*end part"):
+                current_part = None
+            elif _is_keyword(line, "*assembly"):
+                in_assembly = True
+                assembly_present = True
+            elif _is_keyword(line, "*end assembly"):
+                in_assembly = False
+            elif _is_keyword(line, "*instance"):
+                current_instance = {
+                    "name": _parse_inp_option(line, "name") or f"Instance-{len(instances) + 1}",
+                    "part": _parse_inp_option(line, "part"),
+                    "translation": np.zeros(3, dtype=float),
+                    "rotations": [],
+                    "mesh": _new_inp_mesh_definition(),
+                    "transform_line_count": 0,
+                }
+                instances.append(current_instance)
+                mode = "instance_transform"
+            elif _is_keyword(line, "*end instance"):
+                current_instance = None
+            elif _is_keyword(line, "*node"):
+                mode = "nodes"
+                if current_part is not None:
+                    current_mesh = parts[current_part]
+                elif current_instance is not None:
+                    current_mesh = current_instance["mesh"]
+                elif in_assembly:
+                    current_mesh = assembly_mesh
+                else:
+                    current_mesh = global_mesh
+            elif _is_keyword(line, "*element"):
+                mode = "elements"
+                elem_type = _parse_element_type(line)
+                if current_part is not None:
+                    current_mesh = parts[current_part]
+                elif current_instance is not None:
+                    current_mesh = current_instance["mesh"]
+                elif in_assembly:
+                    current_mesh = assembly_mesh
+                else:
+                    current_mesh = global_mesh
+            continue
+
+        if mode == "instance_transform" and current_instance is not None:
+            try:
+                values = [float(value.strip()) for value in line.split(",") if value.strip()]
+            except ValueError:
+                continue
+            if len(values) == 3:
+                current_instance["translation"] += np.asarray(values, dtype=float)
+                current_instance["transform_line_count"] += 1
+            elif len(values) == 7:
+                current_instance["rotations"].append(
+                    (values[:3], values[3:6], values[6])
+                )
+                current_instance["transform_line_count"] += 1
+            continue
+
+        if current_mesh is None:
+            continue
+        if mode == "nodes":
+            values = [value.strip() for value in line.split(",") if value.strip()]
+            if len(values) < 3:
+                continue
+            try:
+                local_id = int(values[0])
+                point = [float(value) for value in values[1:4]]
+            except ValueError:
+                continue
+            point.extend([0.0] * (3 - len(point)))
+            current_mesh["nodes"][local_id] = np.asarray(point[:3], dtype=float)
+        elif mode == "elements":
+            values = [value.strip() for value in line.split(",") if value.strip()]
+            try:
+                integer_values = [int(value) for value in values]
+            except ValueError:
+                flush_pending_element()
+                malformed_elements += 1
+                continue
+            if pending_element is None:
+                if len(integer_values) < 2:
+                    malformed_elements += 1
                     continue
-                try:
-                    local_id = int(parts[0])
-                    point = [float(x) for x in parts[1:]]
-                except ValueError:
-                    continue
-                synthetic_id = len(node_ids) + 1
-                scoped_node_ids[(scope, local_id)] = synthetic_id
-                node_ids.append(synthetic_id)
-                coords.append(point)
-            elif read_elements:
-                parts = [p.strip() for p in line.split(",") if p.strip()]
-                if len(parts) < 2:
-                    continue
-                try:
-                    local_nodes = [int(x) for x in parts[1:]]
-                    nodes = [scoped_node_ids[(scope, node_id)] for node_id in local_nodes]
-                except (ValueError, KeyError):
-                    continue
-                elements.append((nodes, elem_type))
+                pending_element = {
+                    "mesh": current_mesh,
+                    "type": elem_type,
+                    "nodes": integer_values[1:],
+                }
+            else:
+                pending_element["nodes"].extend(integer_values)
+            expected = _expected_element_node_count(elem_type)
+            if expected is None:
+                if not raw_line.rstrip().endswith(","):
+                    flush_pending_element()
+            elif len(pending_element["nodes"]) >= expected:
+                flush_pending_element()
+    flush_pending_element()
+
+    node_ids = []
+    coords = []
+    elements = []
+    unresolved_nodes = 0
+    missing_parts = []
+
+    def append_mesh(mesh, translation=None, rotations=None, preserve_all_nodes=False):
+        nonlocal unresolved_nodes
+        if not mesh["elements"]:
+            return
+        used_ids = set()
+        for connectivity, _element_type in mesh["elements"]:
+            used_ids.update(connectivity)
+        if preserve_all_nodes:
+            ordered_local_ids = list(mesh["nodes"])
+        else:
+            ordered_local_ids = [node_id for node_id in mesh["nodes"] if node_id in used_ids]
+        if not ordered_local_ids:
+            unresolved_nodes += len(used_ids)
+            return
+        local_points = np.asarray(
+            [mesh["nodes"][node_id] for node_id in ordered_local_ids], dtype=float
+        )
+        if translation is not None or rotations:
+            local_points = _instance_transform_points(
+                local_points,
+                np.zeros(3, dtype=float) if translation is None else translation,
+                [] if rotations is None else rotations,
+            )
+        local_to_synthetic = {}
+        for local_id, point in zip(ordered_local_ids, local_points):
+            synthetic_id = len(node_ids) + 1
+            local_to_synthetic[local_id] = synthetic_id
+            node_ids.append(synthetic_id)
+            coords.append(point)
+        for connectivity, element_kind in mesh["elements"]:
+            try:
+                mapped = [local_to_synthetic[node_id] for node_id in connectivity]
+            except KeyError:
+                unresolved_nodes += 1
+                continue
+            elements.append((mapped, element_kind))
+
+    if assembly_present:
+        for instance in instances:
+            if instance["mesh"]["elements"]:
+                append_mesh(
+                    instance["mesh"],
+                    instance["translation"],
+                    instance["rotations"],
+                    preserve_all_nodes=True,
+                )
+                continue
+            part_name = instance["part"]
+            resolved_name = part_names.get((part_name or "").lower())
+            if resolved_name is None:
+                missing_parts.append(part_name or instance["name"])
+                continue
+            append_mesh(
+                parts[resolved_name],
+                instance["translation"],
+                instance["rotations"],
+                preserve_all_nodes=True,
+            )
+        append_mesh(assembly_mesh)
+        if not instances and not assembly_mesh["elements"]:
+            for mesh in parts.values():
+                append_mesh(mesh, preserve_all_nodes=True)
+    else:
+        append_mesh(global_mesh)
+        for mesh in parts.values():
+            append_mesh(mesh, preserve_all_nodes=True)
+
+    if missing_parts:
+        raise ValueError("以下 Instance 引用的 Part 不存在：" + ", ".join(missing_parts))
+    if not node_ids or not elements:
+        raise ValueError("INP 中未找到能够组成有限元网格的节点和单元。")
 
     node_ids = np.asarray(node_ids, dtype=np.int64)
-    coords = np.asarray(coords, dtype=float)
-    _INP_MESH_CACHE[path_key] = (node_ids.copy(), coords.copy(), list(elements))
+    coords = np.asarray(coords, dtype=float).reshape((-1, 3))
+    report = {
+        "assembly": bool(assembly_present),
+        "part_count": len(parts),
+        "instance_count": len(instances),
+        "include_count": max(0, len(source_signatures) - 1),
+        "malformed_elements": int(malformed_elements),
+        "unresolved_elements": int(unresolved_nodes),
+    }
+    _LAST_INP_READ_REPORT = dict(report)
+    _INP_MESH_CACHE[path_key] = (
+        dict(source_signatures),
+        node_ids.copy(),
+        coords.copy(),
+        list(elements),
+        dict(report),
+    )
     return node_ids, coords, elements
 
 
@@ -631,31 +919,66 @@ def _unpack_element(elem):
 
 def _select_cell(elem_type, n):
     et = (elem_type or "").upper()
-    if et:
-        if et.startswith(("CPS8", "CPE8", "CAX8", "S8")):
-            return vtk.vtkQuadraticQuad()
-        if et.startswith("C3D4"):
-            return vtk.vtkTetra()
-        if et.startswith("C3D8"):
-            return vtk.vtkHexahedron()
-        if et.startswith("C3D6"):
-            return vtk.vtkWedge()
-        if et.startswith(("CPS4", "CPE4", "S4", "CAX4")):
-            return vtk.vtkQuad()
-        if et.startswith(("CPS3", "CPE3", "S3", "CAX3")):
-            return vtk.vtkTriangle()
-    if n == 4:
-        return vtk.vtkQuad()
-    if n == 8:
-        return vtk.vtkHexahedron()
-    if n == 3:
-        return vtk.vtkTriangle()
-    if n == 6:
-        return vtk.vtkWedge()
+    if et.startswith(("MASS", "ROTARYI")) and n == 1:
+        return vtk.vtkVertex()
+    if et.startswith(("B", "PIPE", "FRAME", "T2D", "T3D", "CONN")):
+        if n == 2:
+            return vtk.vtkLine()
+        if n == 3:
+            return vtk.vtkQuadraticEdge()
+        return None
+
+    is_surface = et.startswith(
+        ("CPE", "CPS", "CAX", "CGAX", "DC2D", "SAX", "M3D", "R3D", "STRI", "S")
+    ) and not et.startswith("SC")
+    if is_surface:
+        surface_cells = {
+            3: vtk.vtkTriangle,
+            4: vtk.vtkQuad,
+            6: vtk.vtkQuadraticTriangle,
+            7: vtk.vtkBiQuadraticTriangle,
+            8: vtk.vtkQuadraticQuad,
+            9: vtk.vtkBiQuadraticQuad,
+        }
+        cell_class = surface_cells.get(n)
+        return cell_class() if cell_class is not None else None
+
+    is_solid = (
+        ("3D" in et and not et.startswith(("T3D", "R3D", "M3D", "CONN3D")))
+        or et.startswith(("SC", "COH"))
+    )
+    if is_solid:
+        solid_cells = {
+            4: vtk.vtkTetra,
+            5: vtk.vtkPyramid,
+            6: vtk.vtkWedge,
+            8: vtk.vtkHexahedron,
+            10: vtk.vtkQuadraticTetra,
+            13: vtk.vtkQuadraticPyramid,
+            15: vtk.vtkQuadraticWedge,
+            18: vtk.vtkBiQuadraticQuadraticWedge,
+            20: vtk.vtkQuadraticHexahedron,
+            27: vtk.vtkTriQuadraticHexahedron,
+        }
+        cell_class = solid_cells.get(n)
+        return cell_class() if cell_class is not None else None
+
+    # Backward compatibility for old element lists that did not retain a type.
+    if not et:
+        fallback_cells = {
+            2: vtk.vtkLine,
+            3: vtk.vtkTriangle,
+            4: vtk.vtkQuad,
+            6: vtk.vtkWedge,
+            8: vtk.vtkHexahedron,
+        }
+        cell_class = fallback_cells.get(n)
+        return cell_class() if cell_class is not None else None
     return None
 
 
 def build_unstructured_grid(node_ids, coords, elements):
+    global _LAST_GRID_BUILD_REPORT
     points = vtk.vtkPoints() 
     for c in coords:
         if len(c) == 2: 
@@ -668,11 +991,18 @@ def build_unstructured_grid(node_ids, coords, elements):
 
     id_map = {nid: i for i, nid in enumerate(node_ids)}
 
+    unsupported_types = {}
+    invalid_connectivity = 0
     for elem in elements:
         nodes, elem_type = _unpack_element(elem)
         n = len(nodes)
         cell = _select_cell(elem_type, n)
         if cell is None:
+            type_name = (elem_type or f"未知类型({n}节点)").upper()
+            unsupported_types[type_name] = unsupported_types.get(type_name, 0) + 1
+            continue
+        if cell.GetNumberOfPoints() != n:
+            invalid_connectivity += 1
             continue
 
         try:
@@ -680,8 +1010,15 @@ def build_unstructured_grid(node_ids, coords, elements):
                 cell.GetPointIds().SetId(i, id_map[nid])
             grid.InsertNextCell(cell.GetCellType(), cell.GetPointIds())
         except KeyError:
+            invalid_connectivity += 1
             continue
 
+    _LAST_GRID_BUILD_REPORT = {
+        "input_elements": len(elements),
+        "built_elements": int(grid.GetNumberOfCells()),
+        "unsupported_types": dict(unsupported_types),
+        "invalid_connectivity": int(invalid_connectivity),
+    }
     return grid
 
 
@@ -694,12 +1031,25 @@ def build_mirrored_grid(node_ids, coords, elements, normal, point_on_plane):
 def _mirrored_vtk_cell_point_order(point_ids, cell_type):
     point_ids = list(point_ids)
     permutations = {
+        vtk.VTK_VERTEX: (0,),
+        vtk.VTK_LINE: (1, 0),
+        vtk.VTK_QUADRATIC_EDGE: (1, 0, 2),
         vtk.VTK_TRIANGLE: (0, 2, 1),
+        vtk.VTK_QUADRATIC_TRIANGLE: (0, 2, 1, 5, 4, 3),
+        vtk.VTK_BIQUADRATIC_TRIANGLE: (0, 2, 1, 5, 4, 3, 6),
         vtk.VTK_QUAD: (0, 3, 2, 1),
         vtk.VTK_QUADRATIC_QUAD: (0, 3, 2, 1, 7, 6, 5, 4),
+        vtk.VTK_BIQUADRATIC_QUAD: (0, 3, 2, 1, 7, 6, 5, 4, 8),
         vtk.VTK_TETRA: (0, 2, 1, 3),
+        vtk.VTK_QUADRATIC_TETRA: (0, 2, 1, 3, 6, 5, 4, 7, 9, 8),
         vtk.VTK_WEDGE: (0, 2, 1, 3, 5, 4),
+        vtk.VTK_QUADRATIC_WEDGE: (0, 2, 1, 3, 5, 4, 8, 7, 6, 11, 10, 9, 12, 14, 13),
+        vtk.VTK_PYRAMID: (0, 3, 2, 1, 4),
+        vtk.VTK_QUADRATIC_PYRAMID: (0, 3, 2, 1, 4, 8, 7, 6, 5, 9, 12, 11, 10),
         vtk.VTK_HEXAHEDRON: (0, 3, 2, 1, 4, 7, 6, 5),
+        vtk.VTK_QUADRATIC_HEXAHEDRON: (
+            0, 3, 2, 1, 4, 7, 6, 5, 11, 10, 9, 8, 15, 14, 13, 12, 16, 19, 18, 17
+        ),
     }
     permutation = permutations.get(int(cell_type))
     if permutation is None or len(permutation) != len(point_ids):
@@ -4809,13 +5159,30 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-        self.node_ids, self.coords, self.elements = read_inp_mesh(path)
-        if self.coords is None or len(self.coords) == 0:
-            QtWidgets.QMessageBox.warning(self, "警告", "INP 未读取到节点！")
+        try:
+            new_node_ids, new_coords, new_elements = read_inp_mesh(path)
+            new_grid_l = build_unstructured_grid(
+                new_node_ids, new_coords, new_elements
+            )
+            grid_report = dict(_LAST_GRID_BUILD_REPORT)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self, "INP 加载失败", f"无法读取有限元模型：\n{exc}"
+            )
             return
-        if not self.elements:
-            QtWidgets.QMessageBox.warning(self, "警告", "INP 未读取到可支持的单元！")
+        if new_grid_l.GetNumberOfCells() == 0:
+            unsupported = grid_report.get("unsupported_types", {})
+            details = "、".join(unsupported) if unsupported else "未识别的单元连接"
+            QtWidgets.QMessageBox.warning(
+                self, "INP 加载失败", f"没有可显示的有限元单元：{details}"
+            )
             return
+        new_grid_r = vtk.vtkUnstructuredGrid()
+        new_grid_r.DeepCopy(new_grid_l)
+
+        self.node_ids = new_node_ids
+        self.coords = new_coords
+        self.elements = new_elements
 
         self.fields.clear()
         self.rom_fields.clear()
@@ -4846,8 +5213,8 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         self.marker_ren_l.RemoveAllViewProps()
         self.marker_ren_r.RemoveAllViewProps()
 
-        self.grid_l = build_unstructured_grid(self.node_ids, self.coords, self.elements)
-        self.grid_r = build_unstructured_grid(self.node_ids, self.coords, self.elements)
+        self.grid_l = new_grid_l
+        self.grid_r = new_grid_r
         identity = np.arange(len(self.node_ids), dtype=np.int64)
         self.display_source_indices_l = identity
         self.display_source_indices_r = identity.copy()
@@ -4896,6 +5263,39 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
             action.setEnabled(True)
         if hasattr(self, "restore_array_action"):
             self.restore_array_action.setEnabled(False)
+
+        read_report = dict(_LAST_INP_READ_REPORT)
+        model_kind = "装配模型" if read_report.get("assembly") else "有限元模型"
+        message = (
+            f"已加载{model_kind}：{len(self.node_ids)} 个节点，"
+            f"{self.grid_l.GetNumberOfCells()} 个单元"
+        )
+        if read_report.get("assembly"):
+            message += f"，{read_report.get('instance_count', 0)} 个实例"
+        self.statusBar().showMessage(message, 8000)
+        warning_lines = []
+        unsupported = grid_report.get("unsupported_types", {})
+        if unsupported:
+            warning_lines.append("以下单元类型暂时无法转换为可视单元：")
+            warning_lines.extend(
+                f"{element_type}: {count} 个"
+                for element_type, count in sorted(unsupported.items())
+            )
+        malformed_count = read_report.get("malformed_elements", 0)
+        unresolved_count = read_report.get("unresolved_elements", 0)
+        invalid_count = grid_report.get("invalid_connectivity", 0)
+        if malformed_count:
+            warning_lines.append(f"连接数据不完整的单元：{malformed_count} 个")
+        if unresolved_count:
+            warning_lines.append(f"引用了不存在节点的单元：{unresolved_count} 个")
+        if invalid_count:
+            warning_lines.append(f"节点数量与单元类型不一致：{invalid_count} 个")
+        if warning_lines:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "部分网格内容未显示",
+                "\n".join(warning_lines),
+            )
 
     def clear_physical_fields(self):
         self._field_data_epoch += 1

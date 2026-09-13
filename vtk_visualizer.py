@@ -874,6 +874,111 @@ class ErrorFieldWorker(QtCore.QObject):
         self.finished.emit(generated, errors, self.cancel_requested)
 
 
+class TemporalConsistencyWorker(QtCore.QObject):
+    progress = QtCore.pyqtSignal(int, str)
+    finished = QtCore.pyqtSignal(object, object, bool)
+
+    def __init__(self, fom_field, rom_field, pairs, metric_keys):
+        super().__init__()
+        self.fom_field = fom_field
+        self.rom_field = rom_field
+        self.pairs = list(pairs)
+        self.metric_keys = tuple(metric_keys)
+        self.cancel_requested = False
+
+    def cancel(self):
+        self.cancel_requested = True
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        results, errors = [], []
+        try:
+            fom_data = self.fom_field["data"]
+            rom_data = self.rom_field["data"]
+            if fom_data.shape[1] != rom_data.shape[1]:
+                raise ValueError("FOM 与 ROM 的节点数量不一致。")
+            if not self.pairs:
+                raise ValueError("所选范围内没有可比较的帧。")
+
+            # NRMSE 使用整个选定时间范围的固定空间尺度，避免每帧分母
+            # 改变而制造虚假的时间峰值。MAPE 的零值容差也使用固定尺度。
+            reference_min = np.inf
+            reference_max = -np.inf
+            reference_abs_max = 0.0
+            needs_scale = "nrmse" in self.metric_keys or "mape" in self.metric_keys
+            if needs_scale:
+                for position, (fom_index, _rom_index) in enumerate(self.pairs):
+                    if self.cancel_requested:
+                        break
+                    reference = np.asarray(fom_data[fom_index], dtype=float)
+                    finite = reference[np.isfinite(reference)]
+                    if finite.size:
+                        reference_min = min(reference_min, float(np.min(finite)))
+                        reference_max = max(reference_max, float(np.max(finite)))
+                        reference_abs_max = max(reference_abs_max, float(np.max(np.abs(finite))))
+                    if position % 20 == 0:
+                        self.progress.emit(
+                            int(20 * (position + 1) / len(self.pairs)),
+                            "正在统计选定时间范围的参考尺度",
+                        )
+            reference_range = reference_max - reference_min
+            tolerance = max(reference_abs_max, 1.0) * 1.0e-12
+            total = len(self.pairs)
+            for position, (fom_index, rom_index) in enumerate(self.pairs):
+                if self.cancel_requested:
+                    break
+                reference = np.asarray(fom_data[fom_index], dtype=float)
+                prediction = np.asarray(rom_data[rom_index], dtype=float)
+                valid = np.isfinite(reference) & np.isfinite(prediction)
+                valid_count = int(np.count_nonzero(valid))
+                metric_values = {key: np.nan for key in self.metric_keys}
+                zero_count = 0
+                if valid_count:
+                    ref = reference[valid]
+                    pred = prediction[valid]
+                    absolute_error = np.abs(pred - ref)
+                    mse = float(np.mean(np.square(pred - ref)))
+                    if "mae" in metric_values:
+                        metric_values["mae"] = float(np.mean(absolute_error))
+                    if "rmse" in metric_values:
+                        metric_values["rmse"] = float(np.sqrt(mse))
+                    if "nrmse" in metric_values and reference_range > tolerance:
+                        metric_values["nrmse"] = float(np.sqrt(mse) / reference_range * 100.0)
+                    if "relative_l2" in metric_values:
+                        ref_norm = float(np.linalg.norm(ref))
+                        if ref_norm > tolerance * np.sqrt(valid_count):
+                            metric_values["relative_l2"] = (
+                                float(np.linalg.norm(pred - ref)) / ref_norm * 100.0
+                            )
+                    if "mape" in metric_values:
+                        relative_valid = np.abs(ref) > tolerance
+                        zero_count = valid_count - int(np.count_nonzero(relative_valid))
+                        if np.any(relative_valid):
+                            metric_values["mape"] = float(
+                                np.mean(
+                                    absolute_error[relative_valid]
+                                    / np.abs(ref[relative_valid])
+                                ) * 100.0
+                            )
+                results.append({
+                    "fom_index": int(fom_index),
+                    "rom_index": int(rom_index),
+                    "frame_label": str(self.fom_field["frames"][fom_index]),
+                    "metrics": metric_values,
+                    "valid_count": valid_count,
+                    "invalid_count": int(valid.size - valid_count),
+                    "zero_reference_count": zero_count,
+                })
+                if position % 10 == 0 or position == total - 1:
+                    self.progress.emit(
+                        20 + int(79 * (position + 1) / total),
+                        f"正在计算时间一致性（{position + 1}/{total} 帧）",
+                    )
+        except Exception as exc:
+            errors.append(str(exc))
+        self.finished.emit(results, errors, self.cancel_requested)
+
+
 class BackgroundTaskUiBridge(QtCore.QObject):
 
     def __init__(self, owner, thread, worker, progress, finished_callback, task):
@@ -2482,6 +2587,448 @@ class LocalConsistencyDialog(QtWidgets.QDialog):
         self.hide()
 
 
+class TemporalConsistencyDialog(QtWidgets.QDialog):
+    METRICS = (
+        ("mae", "平均绝对误差（MAE）"),
+        ("rmse", "均方根误差（RMSE）"),
+        ("mape", "平均绝对百分比误差（MAPE）"),
+        ("nrmse", "归一化均方根误差（NRMSE）"),
+        ("relative_l2", "相对 L2 误差"),
+    )
+    PERCENT_METRICS = {"mape", "nrmse", "relative_l2"}
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.owner = parent
+        self.setWindowTitle("时间一致性")
+        self.setModal(False)
+        self.setAttribute(QtCore.Qt.WA_DeleteOnClose, False)
+        self.resize(1050, 800)
+        self._rows = []
+        self._matching_note = ""
+        self._result_field_names = None
+        self._result_interval = 1.0
+        self._result_unit = ""
+        self._busy = False
+        self._plot_font = LocalConsistencyDialog._make_plot_font(FONT_MEDIUM_NAME)
+
+        root = QtWidgets.QVBoxLayout(self)
+        settings = QtWidgets.QGroupBox("分析设置", self)
+        form = QtWidgets.QGridLayout(settings)
+        form.addWidget(QtWidgets.QLabel("FOM 物理场：", self), 0, 0)
+        self.fom_combo = QtWidgets.QComboBox(self)
+        form.addWidget(self.fom_combo, 0, 1)
+        form.addWidget(QtWidgets.QLabel("ROM 物理场：", self), 0, 2)
+        self.rom_combo = QtWidgets.QComboBox(self)
+        form.addWidget(self.rom_combo, 0, 3)
+
+        form.addWidget(QtWidgets.QLabel("帧间隔：", self), 1, 0)
+        interval_row = QtWidgets.QHBoxLayout()
+        self.frame_interval_input = QtWidgets.QLineEdit("1", self)
+        validator = QtGui.QDoubleValidator(0.0, 1.0e15, 12, self)
+        validator.setNotation(QtGui.QDoubleValidator.ScientificNotation)
+        self.frame_interval_input.setValidator(validator)
+        self.time_unit_input = QtWidgets.QLineEdit(self)
+        self.time_unit_input.setPlaceholderText("单位")
+        interval_row.addWidget(self.frame_interval_input, 2)
+        interval_row.addWidget(QtWidgets.QLabel("单位：", self))
+        interval_row.addWidget(self.time_unit_input, 1)
+        form.addLayout(interval_row, 1, 1)
+
+        form.addWidget(QtWidgets.QLabel("处理范围：", self), 1, 2)
+        range_row = QtWidgets.QHBoxLayout()
+        self.frame_range_check = QtWidgets.QCheckBox("指定帧", self)
+        self.start_frame_input = QtWidgets.QSpinBox(self)
+        self.end_frame_input = QtWidgets.QSpinBox(self)
+        for editor in (self.start_frame_input, self.end_frame_input):
+            editor.setRange(1, 1)
+            editor.setEnabled(False)
+        range_row.addWidget(self.frame_range_check)
+        range_row.addWidget(QtWidgets.QLabel("帧索引：", self))
+        range_row.addWidget(self.start_frame_input)
+        range_row.addWidget(QtWidgets.QLabel("到", self))
+        range_row.addWidget(self.end_frame_input)
+        form.addLayout(range_row, 1, 3)
+
+        metric_group = QtWidgets.QGroupBox("逐帧空间误差指标", self)
+        metric_layout = QtWidgets.QHBoxLayout(metric_group)
+        self.metric_checks = {}
+        for key, label in self.METRICS:
+            check = QtWidgets.QCheckBox(label, metric_group)
+            check.setChecked(key in ("mae", "rmse"))
+            self.metric_checks[key] = check
+            metric_layout.addWidget(check)
+        metric_layout.addStretch(1)
+        form.addWidget(metric_group, 2, 0, 1, 4)
+
+        ranking_row = QtWidgets.QHBoxLayout()
+        ranking_row.addWidget(QtWidgets.QLabel("异常时刻主指标：", self))
+        self.rank_metric_combo = QtWidgets.QComboBox(self)
+        ranking_row.addWidget(self.rank_metric_combo)
+        ranking_row.addWidget(QtWidgets.QLabel("峰值前", self))
+        self.top_count_spin = QtWidgets.QSpinBox(self)
+        self.top_count_spin.setRange(1, 100)
+        self.top_count_spin.setValue(10)
+        ranking_row.addWidget(self.top_count_spin)
+        ranking_row.addWidget(QtWidgets.QLabel("帧", self))
+        ranking_row.addStretch(1)
+        form.addLayout(ranking_row, 3, 0, 1, 4)
+
+        button_row = QtWidgets.QHBoxLayout()
+        self.status_label = QtWidgets.QLabel("请选择 FOM、ROM 物理场后点击“分析”。", self)
+        self.status_label.setWordWrap(True)
+        self.analyze_button = QtWidgets.QPushButton("分析", self)
+        self.export_button = QtWidgets.QPushButton("导出", self)
+        close_button = QtWidgets.QPushButton("关闭", self)
+        self.analyze_button.clicked.connect(self.analyze)
+        self.export_button.clicked.connect(self.export_data)
+        close_button.clicked.connect(self.hide)
+        button_row.addWidget(self.status_label, 1)
+        button_row.addWidget(self.analyze_button)
+        button_row.addWidget(self.export_button)
+        button_row.addWidget(close_button)
+        form.addLayout(button_row, 4, 0, 1, 4)
+        root.addWidget(settings)
+
+        self.figure = Figure(figsize=(8.5, 4.7), tight_layout=True)
+        self.canvas = FigureCanvas(self.figure)
+        self.axes = self.figure.add_subplot(111)
+        self.percent_axes = None
+        root.addWidget(self.canvas, 1)
+
+        self.anomaly_note = QtWidgets.QLabel(
+            "异常标记：主指标超过“中位数 + 3 × 1.4826 × MAD”；"
+            "表格列出峰值前 N 帧，排名不代表全部都异常。", self
+        )
+        self.anomaly_note.setWordWrap(True)
+        root.addWidget(self.anomaly_note)
+        self.result_table = QtWidgets.QTableWidget(0, 7, self)
+        self.result_table.setHorizontalHeaderLabels(
+            ["排名", "FOM 帧", "ROM 帧", "时间", "主指标", "有效节点", "异常"]
+        )
+        self.result_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.result_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.result_table.horizontalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.Stretch
+        )
+        self.result_table.cellDoubleClicked.connect(self.jump_to_frame)
+        root.addWidget(self.result_table, 0)
+
+        self.frame_range_check.toggled.connect(self._set_frame_range_enabled)
+        self.fom_combo.currentIndexChanged.connect(self._update_frame_range)
+        for check in self.metric_checks.values():
+            check.toggled.connect(self._metric_selection_changed)
+        self.rank_metric_combo.currentIndexChanged.connect(self._refresh_results)
+        self.top_count_spin.valueChanged.connect(self._refresh_results)
+        self._refresh_rank_metrics()
+        self._draw_empty_plot()
+
+    def _set_frame_range_enabled(self, checked):
+        self.start_frame_input.setEnabled(checked)
+        self.end_frame_input.setEnabled(checked)
+
+    def _update_frame_range(self):
+        name = self.fom_combo.currentText()
+        count = self.owner.fields[name]["data"].shape[0] if name in self.owner.fields else 1
+        count = max(1, int(count))
+        self.start_frame_input.setRange(1, count)
+        self.end_frame_input.setRange(1, count)
+        self.end_frame_input.setValue(count)
+
+    def refresh_fields(self):
+        old_fom, old_rom = self.fom_combo.currentText(), self.rom_combo.currentText()
+        self.fom_combo.blockSignals(True)
+        self.rom_combo.blockSignals(True)
+        self.fom_combo.clear()
+        self.rom_combo.clear()
+        self.fom_combo.addItems(list(self.owner.fields))
+        self.rom_combo.addItems(list(self.owner.rom_fields))
+        if old_fom in self.owner.fields:
+            self.fom_combo.setCurrentText(old_fom)
+        elif self.owner.current_field in self.owner.fields:
+            self.fom_combo.setCurrentText(self.owner.current_field)
+        if old_rom in self.owner.rom_fields:
+            self.rom_combo.setCurrentText(old_rom)
+        elif self.fom_combo.currentText() in self.owner.rom_fields:
+            self.rom_combo.setCurrentText(self.fom_combo.currentText())
+        elif self.owner.rom_current_field in self.owner.rom_fields:
+            self.rom_combo.setCurrentText(self.owner.rom_current_field)
+        self.fom_combo.blockSignals(False)
+        self.rom_combo.blockSignals(False)
+        self._update_frame_range()
+
+    def _refresh_rank_metrics(self):
+        current = self.rank_metric_combo.currentData()
+        self.rank_metric_combo.blockSignals(True)
+        self.rank_metric_combo.clear()
+        for key, label in self.METRICS:
+            if self.metric_checks[key].isChecked():
+                self.rank_metric_combo.addItem(label, key)
+        position = self.rank_metric_combo.findData(current)
+        if position >= 0:
+            self.rank_metric_combo.setCurrentIndex(position)
+        self.rank_metric_combo.blockSignals(False)
+        self._refresh_results()
+
+    def _metric_selection_changed(self):
+        if self._rows:
+            self.clear_results()
+            self.status_label.setText("误差指标已更改，请重新点击“分析”。")
+        self._refresh_rank_metrics()
+
+    def _draw_empty_plot(self):
+        self.figure.clear()
+        self.axes = self.figure.add_subplot(111)
+        self.percent_axes = None
+        self.axes.text(
+            0.5, 0.5, "设置参数后点击“分析”生成逐帧误差曲线",
+            ha="center", va="center", transform=self.axes.transAxes,
+            fontproperties=self._plot_font,
+        )
+        self.axes.tick_params(direction="in", top=True, right=True)
+        self.canvas.draw_idle()
+
+    def clear_results(self):
+        self._rows = []
+        self._result_field_names = None
+        self.result_table.setRowCount(0)
+        self.status_label.setText("请选择物理场并设置分析参数。")
+        self._draw_empty_plot()
+
+    def analyze(self):
+        if self._busy:
+            return
+        fom_name, rom_name = self.fom_combo.currentText(), self.rom_combo.currentText()
+        if fom_name not in self.owner.fields or rom_name not in self.owner.rom_fields:
+            QtWidgets.QMessageBox.warning(self, "无法分析", "请先分别加载 FOM 与 ROM 物理场。")
+            return
+        selected = [key for key, check in self.metric_checks.items() if check.isChecked()]
+        if not selected:
+            QtWidgets.QMessageBox.warning(self, "无法分析", "请至少选择一个误差指标。")
+            return
+        try:
+            interval = float(self.frame_interval_input.text().strip())
+            if not np.isfinite(interval) or interval <= 0:
+                raise ValueError("帧间隔必须是大于 0 的数值。")
+            fom_field = self.owner.fields[fom_name]
+            rom_field = self.owner.rom_fields[rom_name]
+            if fom_field["data"].shape[1] != rom_field["data"].shape[1]:
+                raise ValueError("FOM 与 ROM 的节点数量不一致。")
+            pairs, matching_note = GlobalConsistencyDialog._matched_frames(
+                fom_field, rom_field
+            )
+            if self.frame_range_check.isChecked():
+                start = self.start_frame_input.value()
+                end = self.end_frame_input.value()
+                if start > end:
+                    raise ValueError("起始帧不能大于结束帧。")
+                pairs = [pair for pair in pairs if start - 1 <= pair[0] <= end - 1]
+            if not pairs:
+                raise ValueError("指定范围内没有可比较的 FOM 与 ROM 帧。")
+        except (ValueError, TypeError) as exc:
+            QtWidgets.QMessageBox.warning(self, "无法分析", str(exc))
+            return
+
+        self._busy = True
+        self.analyze_button.setEnabled(False)
+        self.status_label.setText("正在后台计算逐帧误差…")
+        epoch = self.owner._field_data_epoch
+        worker = TemporalConsistencyWorker(fom_field, rom_field, pairs, selected)
+        unit = self.time_unit_input.text().strip()
+
+        def apply_results(rows, errors, cancelled):
+            self._busy = False
+            self.analyze_button.setEnabled(True)
+            if epoch != self.owner._field_data_epoch:
+                return
+            if errors:
+                QtWidgets.QMessageBox.warning(self, "分析失败", "\n".join(errors))
+                self.status_label.setText("分析失败，请检查所选字段和帧。")
+                return
+            if cancelled:
+                self.status_label.setText("分析已取消，原结果保持不变。")
+                return
+            self._rows = rows
+            self._result_field_names = (fom_name, rom_name)
+            self._result_interval = interval
+            self._result_unit = unit
+            self._matching_note = matching_note
+            self._draw_plot(selected)
+            self._refresh_results()
+
+        self.owner._start_background_task(worker, "正在分析时间一致性", apply_results)
+
+    def _draw_plot(self, selected):
+        self.figure.clear()
+        self.axes = self.figure.add_subplot(111)
+        self.percent_axes = None
+        if any(key in self.PERCENT_METRICS for key in selected) and any(
+            key not in self.PERCENT_METRICS for key in selected
+        ):
+            self.percent_axes = self.axes.twinx()
+        colors = {
+            "mae": "#1f4e79", "rmse": "#d95f02", "mape": "#a21caf",
+            "nrmse": "#16a34a", "relative_l2": "#b91c1c",
+        }
+        x = np.asarray(
+            [row["fom_index"] * self._result_interval for row in self._rows],
+            dtype=float,
+        )
+        labels = dict(self.METRICS)
+        handles = []
+        for key in selected:
+            values = np.asarray([row["metrics"][key] for row in self._rows], dtype=float)
+            axis = self.percent_axes if key in self.PERCENT_METRICS and self.percent_axes else self.axes
+            (line,) = axis.plot(
+                x, values, linewidth=2.0, color=colors[key], label=labels[key]
+            )
+            handles.append(line)
+        self.axes.set_xlabel(
+            f"时间（{self._result_unit}）" if self._result_unit else "时间",
+            fontproperties=self._plot_font,
+        )
+        abs_metrics = any(key not in self.PERCENT_METRICS for key in selected)
+        self.axes.set_ylabel(
+            "绝对误差" if abs_metrics else "误差（%）",
+            fontproperties=self._plot_font,
+        )
+        if self.percent_axes is not None:
+            self.percent_axes.set_ylabel("相对误差（%）", fontproperties=self._plot_font)
+            self.percent_axes.tick_params(direction="in")
+        self.axes.tick_params(direction="in", top=True, right=True)
+        self.axes.margins(x=0.03, y=0.08)
+        self.axes.legend(handles=handles, prop=self._plot_font, frameon=False)
+        for axis in (self.axes, self.percent_axes):
+            if axis is not None:
+                for label in axis.get_xticklabels() + axis.get_yticklabels():
+                    label.set_fontproperties(self._plot_font)
+        self._anomaly_markers = None
+        self.canvas.draw_idle()
+
+    def _refresh_results(self):
+        self.result_table.setRowCount(0)
+        key = self.rank_metric_combo.currentData()
+        if not self._rows or key is None or key not in self._rows[0]["metrics"]:
+            return
+        candidates = [
+            row for row in self._rows if np.isfinite(row["metrics"].get(key, np.nan))
+        ]
+        if not candidates:
+            self.status_label.setText("所选主指标在这些帧中无有效值。")
+            return
+        values = np.asarray([row["metrics"][key] for row in candidates], dtype=float)
+        median = float(np.median(values))
+        mad = float(np.median(np.abs(values - median)))
+        threshold = median + 3.0 * 1.4826 * mad
+        ranked = sorted(
+            candidates, key=lambda row: row["metrics"][key], reverse=True
+        )[:self.top_count_spin.value()]
+        if getattr(self, "_anomaly_markers", None) is not None:
+            self._anomaly_markers.remove()
+            self._anomaly_markers = None
+        abnormal_rows = [row for row in candidates if row["metrics"][key] > threshold]
+        if abnormal_rows:
+            axis = (
+                self.percent_axes
+                if key in self.PERCENT_METRICS and self.percent_axes is not None
+                else self.axes
+            )
+            self._anomaly_markers = axis.scatter(
+                [row["fom_index"] * self._result_interval for row in abnormal_rows],
+                [row["metrics"][key] for row in abnormal_rows],
+                s=42, marker="o", facecolors="none", edgecolors="#d00000",
+                linewidths=1.5, zorder=10,
+            )
+        self.canvas.draw_idle()
+        self.result_table.setRowCount(len(ranked))
+        for position, row in enumerate(ranked):
+            value = row["metrics"][key]
+            abnormal = value > threshold
+            columns = (
+                str(position + 1),
+                str(row["fom_index"] + 1),
+                str(row["rom_index"] + 1),
+                f"{row['fom_index'] * self._result_interval:.6g}",
+                f"{value:.6g}" + (" %" if key in self.PERCENT_METRICS else ""),
+                str(row["valid_count"]),
+                "是" if abnormal else "否",
+            )
+            for column, content in enumerate(columns):
+                item = QtWidgets.QTableWidgetItem(content)
+                item.setData(QtCore.Qt.UserRole, row["fom_index"])
+                self.result_table.setItem(position, column, item)
+        self.status_label.setText(
+            f"{self._matching_note}；计算 {len(self._rows)} 帧；"
+            f"主指标异常阈值 {threshold:.6g}"
+            f"{' %' if key in self.PERCENT_METRICS else ''}；"
+            f"全范围异常 {sum(row['metrics'][key] > threshold for row in candidates)} 帧。"
+        )
+
+    def jump_to_frame(self, table_row, _column):
+        item = self.result_table.item(table_row, 0)
+        if item is None or self._result_field_names is None:
+            return
+        fom_name, rom_name = self._result_field_names
+        if fom_name not in self.owner.fields or rom_name not in self.owner.rom_fields:
+            QtWidgets.QMessageBox.warning(self, "无法跳转", "原物理场已被清除。")
+            return
+        fom_index = int(item.data(QtCore.Qt.UserRole))
+        self.owner.combo_left.setCurrentText(fom_name)
+        self.owner.combo_right.setCurrentText(rom_name)
+        self.owner.slider.setValue(fom_index)
+        self.owner.current_frame = fom_index
+        self.owner.update_both_views()
+        matched = next(
+            (row for row in self._rows if row["fom_index"] == fom_index), None
+        )
+        note = ""
+        if matched is not None and matched["rom_index"] != fom_index:
+            note = "；注意：主窗口 ROM 按同位置帧显示，分析使用匹配的 ROM 帧"
+        self.owner.statusBar().showMessage(
+            f"已跳转到 FOM 第 {fom_index + 1} 帧{note}", 9000
+        )
+
+    def export_data(self):
+        if not self._rows:
+            QtWidgets.QMessageBox.warning(self, "无法导出", "请先完成时间一致性分析。")
+            return
+        columns = {
+            "FOM frame": [row["fom_index"] + 1 for row in self._rows],
+            "ROM frame": [row["rom_index"] + 1 for row in self._rows],
+            "FOM frame label": [row["frame_label"] for row in self._rows],
+            "Time": [row["fom_index"] * self._result_interval for row in self._rows],
+            "Valid nodes": [row["valid_count"] for row in self._rows],
+            "Invalid nodes": [row["invalid_count"] for row in self._rows],
+        }
+        for key, label in self.METRICS:
+            if key in self._rows[0]["metrics"]:
+                columns[label] = [row["metrics"][key] for row in self._rows]
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self, "导出时间一致性数据", "temporal_consistency.csv",
+            "CSV 文件 (*.csv);;Excel 文件 (*.xlsx)",
+        )
+        if not path:
+            return
+        suffix = Path(path).suffix.lower()
+        if suffix not in (".csv", ".xlsx"):
+            suffix = ".xlsx" if "Excel" in selected_filter else ".csv"
+            path += suffix
+        try:
+            frame = pd.DataFrame(columns)
+            if suffix == ".xlsx":
+                frame.to_excel(path, index=False, engine="openpyxl")
+            else:
+                frame.to_csv(path, index=False, encoding="utf-8-sig")
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "导出失败", str(exc))
+            return
+        self.status_label.setText(f"已导出 {len(self._rows)} 帧数据到 {path}")
+
+    def closeEvent(self, event):
+        event.ignore()
+        self.hide()
+
+
 class ErrorFieldDialog(QtWidgets.QDialog):
     ERROR_TYPES = (
         ("absolute", "绝对误差"),
@@ -2960,6 +3507,7 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         self.extreme_query_dialog = None
         self.global_consistency_dialog = None
         self.local_consistency_dialog = None
+        self.temporal_consistency_dialog = None
         self.error_field_dialog = None
         self.extreme_actor_l = None
         self.extreme_actor_r = None
@@ -3230,6 +3778,10 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         local_consistency_action = QtWidgets.QAction("局部一致性", self)
         local_consistency_action.triggered.connect(self.show_local_consistency_dialog)
         menu_analysis.addAction(local_consistency_action)
+
+        temporal_consistency_action = QtWidgets.QAction("时间一致性", self)
+        temporal_consistency_action.triggered.connect(self.show_temporal_consistency_dialog)
+        menu_analysis.addAction(temporal_consistency_action)
 
         ctrl_widget = QtWidgets.QWidget()
         ctrl_layout = QtWidgets.QHBoxLayout(ctrl_widget)
@@ -3683,6 +4235,14 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         self.local_consistency_dialog.show()
         self.local_consistency_dialog.raise_()
         self.local_consistency_dialog.activateWindow()
+
+    def show_temporal_consistency_dialog(self):
+        if self.temporal_consistency_dialog is None:
+            self.temporal_consistency_dialog = TemporalConsistencyDialog(self)
+        self.temporal_consistency_dialog.refresh_fields()
+        self.temporal_consistency_dialog.show()
+        self.temporal_consistency_dialog.raise_()
+        self.temporal_consistency_dialog.activateWindow()
 
     def show_error_field_dialog(self):
         if self.error_field_dialog is None:
@@ -5194,6 +5754,9 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         self.rom_current_field = ""
         self.error_current_field = ""
         self.current_frame = 0
+        if self.temporal_consistency_dialog is not None:
+            self.temporal_consistency_dialog.refresh_fields()
+            self.temporal_consistency_dialog.clear_results()
         if self.node_query_dialog is not None:
             self.node_query_dialog.clear_result()
         self.extreme_actor_l = None
@@ -5368,6 +5931,9 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
             self.local_consistency_dialog.refresh_fields()
             self.local_consistency_dialog.status_label.setText("请选择物理场并设置分析参数。")
             self.local_consistency_dialog._draw_empty_plot()
+        if self.temporal_consistency_dialog is not None:
+            self.temporal_consistency_dialog.refresh_fields()
+            self.temporal_consistency_dialog.clear_results()
         if self.error_field_dialog is not None:
             self.error_field_dialog.refresh_fields()
             self.error_field_dialog.status_label.setText(
@@ -5445,6 +6011,9 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
                 combo.setCurrentText(loaded_names[0])
             if self.local_consistency_dialog is not None:
                 self.local_consistency_dialog.refresh_fields()
+            if self.temporal_consistency_dialog is not None:
+                self.temporal_consistency_dialog.refresh_fields()
+                self.temporal_consistency_dialog.clear_results()
 
             if cancelled:
                 self.statusBar().showMessage(

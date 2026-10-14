@@ -1,48 +1,39 @@
 # ODB VTK Visualizer
 
-基于 PyQt5、VTK 和 Matplotlib 的物理场可视化与分析工具。
+Abaqus 物理场导出、全阶/降阶模型可视化与误差分析工具。
 
-![软件界面](assets/example.png)
+## 安装
 
-## 主要功能
-
-全阶/降阶模型多物理场云图渲染、动画播放、可视化设置与数值分析。
-
-## 项目结构
-
-```text
-odb-vtk-visualizer/
-├── assets/                         # 图标、界面示例和内置中文字体
-├── data/                           # 本地示例/分析数据（默认被 Git 忽略）
-├── script/
-│   ├── odb_output_csv.py           # 从 ODB 直接导出 CSV
-│   ├── odb_output_rpt.py           # 从 ODB 逐帧导出 RPT
-│   └── com_physical_field_matrix.py # 将 RPT 合并为 CSV
-├── vtk_visualizer.py               # GUI 主程序
-├── requirements.txt                # Python 依赖
-└── README.md
-```
-
-## 环境要求
-
-- Python 3.x
-- 安装依赖：
+需要 Python 3；ODB 导出另需本机安装 Abaqus。
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## 使用方法
+## ODB Exporter
 
-### 数据准备
+<img src="assets/example2.png" alt="ODB Exporter" style="zoom:50%;" />
 
-在 Abaqus/CAE 中执行脚本（File -> Run Script）：
+```bash
+python odb_exporter.py
+```
 
-- `script/odb_output_csv.py`：直接从 `.odb` 导出 `.csv`。
-- `script/odb_output_rpt.py`：导出每一帧 `.rpt`，再用 `script/com_physical_field_matrix.py` 合并为 `.csv`。
+选择 Abaqus 环境、ODB、INP、物理场及分量，设置输出目录后点击“开始导出”；点击“新增”添加导出项。
 
-脚本里的 `odbpath` / `var` / `var_choose` 等参数需要按实际模型配置。
+- 单独导出：默认匹配同名 INP，也可手动指定。
+- 批量导出：选择 ODB 目录和共用模板 INP，模板须与模型的实例及节点对应。
+- 旧版 ODB 需要升级时弹窗确认，生成副本后继续，原文件保留。
 
-### 运行可视化
+CSV 每帧一行、每节点一列，按 INP 节点顺序排列。仅导出包含多个实例的装配体时生成节点映射表 `*_nodes.csv`，单实例不生成；映射表不作为物理场加载。
 
-运行：`python vtk_visualizer.py`，依次加载 `.inp`、FOM `.csv`、ROM `.csv`。
+## VTK Visualizer
+
+![VTK Visualizer](assets/example1.png)
+
+```bash
+python vtk_visualizer.py
+```
+
+加载对应 INP 和 FOM/ROM 物理场数据，查看云图、动画及误差分析。
+
+界面入口放在根目录；被调用的 Python 脚本统一放在 `script/`。ODB 导出后台为 `script/odb_export_backend.py`，需与入口一起保留。

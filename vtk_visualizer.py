@@ -14,6 +14,7 @@ from PyQt5.QtWidgets import QFileDialog
 from PyQt5.QtGui import QIcon
 import vtk
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
+from script.assembly_display import AssemblyDisplayController
 
 VTK_OUTPUT_WINDOW = vtk.vtkOutputWindow()
 vtk.vtkOutputWindow.SetInstance(VTK_OUTPUT_WINDOW)
@@ -378,8 +379,10 @@ def read_inp_mesh(inp_path):
     elements = []
     unresolved_nodes = 0
     missing_parts = []
+    display_objects = []
 
-    def append_mesh(mesh, translation=None, rotations=None, preserve_all_nodes=False):
+    def append_mesh(mesh, translation=None, rotations=None, preserve_all_nodes=False,
+                    object_name="模型"):
         nonlocal unresolved_nodes
         if not mesh["elements"]:
             return
@@ -403,6 +406,7 @@ def read_inp_mesh(inp_path):
                 [] if rotations is None else rotations,
             )
         local_to_synthetic = {}
+        node_start = len(node_ids)
         for local_id, point in zip(ordered_local_ids, local_points):
             synthetic_id = len(node_ids) + 1
             local_to_synthetic[local_id] = synthetic_id
@@ -415,6 +419,9 @@ def read_inp_mesh(inp_path):
                 unresolved_nodes += 1
                 continue
             elements.append((mapped, element_kind))
+        display_objects.append({
+            "name": object_name, "node_start": node_start, "node_end": len(node_ids),
+        })
 
     if assembly_present:
         for instance in instances:
@@ -424,6 +431,7 @@ def read_inp_mesh(inp_path):
                     instance["translation"],
                     instance["rotations"],
                     preserve_all_nodes=True,
+                    object_name=instance["name"],
                 )
                 continue
             part_name = instance["part"]
@@ -436,15 +444,16 @@ def read_inp_mesh(inp_path):
                 instance["translation"],
                 instance["rotations"],
                 preserve_all_nodes=True,
+                object_name=instance["name"],
             )
-        append_mesh(assembly_mesh)
+        append_mesh(assembly_mesh, object_name="装配级网格")
         if not instances and not assembly_mesh["elements"]:
-            for mesh in parts.values():
-                append_mesh(mesh, preserve_all_nodes=True)
+            for name, mesh in parts.items():
+                append_mesh(mesh, preserve_all_nodes=True, object_name=name)
     else:
         append_mesh(global_mesh)
-        for mesh in parts.values():
-            append_mesh(mesh, preserve_all_nodes=True)
+        for name, mesh in parts.items():
+            append_mesh(mesh, preserve_all_nodes=True, object_name=name)
 
     if missing_parts:
         raise ValueError("以下 Instance 引用的 Part 不存在：" + ", ".join(missing_parts))
@@ -460,6 +469,7 @@ def read_inp_mesh(inp_path):
         "include_count": max(0, len(source_signatures) - 1),
         "malformed_elements": int(malformed_elements),
         "unresolved_elements": int(unresolved_nodes),
+        "display_objects": display_objects,
     }
     _LAST_INP_READ_REPORT = dict(report)
     _INP_MESH_CACHE[path_key] = (
@@ -3434,6 +3444,87 @@ class CustomInteractorStyle(vtk.vtkInteractorStyleTrackballCamera):
         ren.ResetCameraClippingRange()
         self.GetInteractor().Render()
 
+class AssemblyDisplayDialog(QtWidgets.QDialog):
+    def __init__(self, owner):
+        super().__init__(owner, QtCore.Qt.Tool)
+        self.owner = owner
+        self.setWindowTitle("装配显示设置")
+        self.setModal(False)
+        self.resize(430, 350)
+        self._ui_font = QtGui.QFont(owner.font())
+        self.setFont(self._ui_font)
+        layout = QtWidgets.QVBoxLayout(self)
+        self.table = QtWidgets.QTableWidget(0, 2, self)
+        self.table.setHorizontalHeaderLabels(["部件对象（实例）", "显示状态"])
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table.setFont(self._ui_font)
+        self.table.horizontalHeader().setFont(self._ui_font)
+        self.table.verticalHeader().setFont(self._ui_font)
+        self.table.horizontalHeader().setDefaultAlignment(
+            QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        self.table.horizontalHeader().setStyleSheet(
+            "QHeaderView::section { padding: 6px 8px; }")
+        self.table.verticalHeader().setDefaultSectionSize(36)
+        self.table.verticalHeader().setMinimumSectionSize(36)
+        self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        layout.addWidget(self.table)
+        self.status = QtWidgets.QLabel(self)
+        self.status.setFont(self._ui_font)
+        self.status.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.setSpacing(8)
+        buttons.addStretch(1)
+        apply_button = QtWidgets.QPushButton("应用", self)
+        restore_button = QtWidgets.QPushButton("恢复", self)
+        for button in (apply_button, restore_button):
+            button.setFont(self._ui_font)
+            button.setFixedSize(76, 30)
+        apply_button.clicked.connect(self.apply)
+        restore_button.clicked.connect(self.restore)
+        buttons.addWidget(apply_button)
+        buttons.addWidget(restore_button)
+        layout.addLayout(buttons)
+
+    def refresh(self):
+        controller = self.owner.assembly_display
+        self.table.setRowCount(len(controller.objects))
+        for index, item in enumerate(controller.objects):
+            label = QtWidgets.QTableWidgetItem(item["name"])
+            label.setFont(self._ui_font)
+            label.setTextAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+            label.setToolTip(f"源节点数量：{item['node_end'] - item['node_start']}")
+            self.table.setItem(index, 0, label)
+            combo = QtWidgets.QComboBox(self.table)
+            combo.setFont(self._ui_font)
+            combo.setStyleSheet("QComboBox { padding-left: 8px; }")
+            for text, state in (("显示", "show"), ("透明", "transparent"), ("隐藏", "hidden")):
+                combo.addItem(text, state)
+            combo.setCurrentIndex(combo.findData(controller.states[index]))
+            self.table.setCellWidget(index, 1, combo)
+        self.status.setText(
+            "透明显示外轮廓及30°以上的几何特征边；隐藏完全不显示。修改后点击“应用”。"
+            if controller.objects else "请先加载 INP 文件。")
+
+    def apply(self):
+        self.owner.apply_assembly_display({
+            index: self.table.cellWidget(index, 1).currentData()
+            for index in range(self.table.rowCount())
+        })
+        self.status.setText("已应用。切换帧和物理场会保留这些显示状态。")
+
+    def restore(self):
+        self.owner.apply_assembly_display({})
+        self.refresh()
+        self.status.setText("所有对象已恢复显示，保留当前物理场、帧和可视化设置。")
+
+    def closeEvent(self, event):
+        event.ignore()
+        self.hide()
+
+
 class VTKCompareWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -3441,6 +3532,8 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         self.node_ids = None
         self.coords = None
         self.elements = None
+        self.assembly_display = AssemblyDisplayController(self, build_mesh_edge_polydata)
+        self.assembly_display_dialog = None
         self.display_source_indices_l = None
         self.display_source_indices_r = None
         self.is_rotational_surface = False
@@ -3533,7 +3626,7 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
 
     def _init_ui(self):
         self.setWindowTitle("Vtk Visualizer")
-        icon_path = os.path.join(str(_project_root()), "assets", "logo.ico")
+        icon_path = str(Path(__file__).resolve().parent / "assets" / "vtk.ico")
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
         self.resize(1650, 950)
@@ -3783,6 +3876,11 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         temporal_consistency_action.triggered.connect(self.show_temporal_consistency_dialog)
         menu_analysis.addAction(temporal_consistency_action)
 
+        menu_assembly = menubar.addMenu("装配管理")
+        assembly_display_action = QtWidgets.QAction("显示设置", self)
+        assembly_display_action.triggered.connect(self.show_assembly_display_dialog)
+        menu_assembly.addAction(assembly_display_action)
+
         ctrl_widget = QtWidgets.QWidget()
         ctrl_layout = QtWidgets.QHBoxLayout(ctrl_widget)
         ctrl_layout.setContentsMargins(0, 0, 0, 0)
@@ -3920,6 +4018,23 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
 
     def _mark_wireframe_dirty(self):
         self._wireframe_dirty = True
+        self.assembly_display.invalidate()
+
+    def show_assembly_display_dialog(self):
+        if self.assembly_display_dialog is None:
+            self.assembly_display_dialog = AssemblyDisplayDialog(self)
+        self.assembly_display_dialog.refresh()
+        self.assembly_display_dialog.show()
+        self.assembly_display_dialog.raise_()
+        self.assembly_display_dialog.activateWindow()
+
+    def apply_assembly_display(self, states):
+        self.assembly_display.set_states(states)
+        if self.current_field in self.fields:
+            self.update_both_views()
+        else:
+            self.safe_render_both()
+        self.statusBar().showMessage("装配显示设置已应用。", 5000)
 
     def _wire_source_grids(self):
         if (
@@ -3932,6 +4047,8 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         return self.grid_l, self.grid_r
 
     def _ensure_wireframe_ready(self):
+        if self.assembly_display.active:
+            return
         if not hasattr(self, "wire_mapper_l") or not hasattr(self, "wire_mapper_r"):
             return
         if not self._wire_should_be_visible() or not self._wireframe_dirty:
@@ -4098,17 +4215,29 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         point_picker = vtk.vtkPointPicker()
         point_picker.SetTolerance(0.025)
         point_picker.PickFromListOn()
-        point_picker.AddPickList(actor)
+        targets = self.assembly_display.pick_targets("r" if side == "right" else "l")
+        for target_actor, _dataset, _point_ids in targets:
+            point_picker.AddPickList(target_actor)
+        point_ids = None
         point_id = -1
         if point_picker.Pick(float(display_x), float(display_y), 0.0, renderer):
             point_id = int(point_picker.GetPointId())
+            for target_actor, target_grid, target_ids in targets:
+                if target_actor == point_picker.GetActor():
+                    grid, point_ids = target_grid, target_ids
+                    break
 
         if point_id < 0:
             cell_picker = vtk.vtkCellPicker()
             cell_picker.SetTolerance(0.0005)
             cell_picker.PickFromListOn()
-            cell_picker.AddPickList(actor)
+            for target_actor, _dataset, _point_ids in targets:
+                cell_picker.AddPickList(target_actor)
             if cell_picker.Pick(float(display_x), float(display_y), 0.0, renderer):
+                for target_actor, target_grid, target_ids in targets:
+                    if target_actor == cell_picker.GetActor():
+                        grid, point_ids = target_grid, target_ids
+                        break
                 point_id = self._nearest_cell_point_id(
                     grid,
                     int(cell_picker.GetCellId()),
@@ -4120,14 +4249,15 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
                 self.node_query_dialog.set_status("未拾取到节点，请在模型表面附近单击。")
             return
 
+        display_point_id = int(point_ids[point_id]) if point_ids is not None else point_id
         if source_indices is None:
-            source_index = point_id
+            source_index = display_point_id
         else:
-            if point_id >= len(source_indices):
+            if display_point_id >= len(source_indices):
                 if self.node_query_dialog is not None:
                     self.node_query_dialog.set_status("节点映射失败：显示节点索引超出范围。")
                 return
-            source_index = int(source_indices[point_id])
+            source_index = int(source_indices[display_point_id])
         if source_index < 0 or source_index >= len(self.node_ids):
             if self.node_query_dialog is not None:
                 self.node_query_dialog.set_status("节点映射失败：源节点索引无效。")
@@ -4349,6 +4479,12 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         else:
             modify_indices = selected_indices
 
+        if self.assembly_display.active:
+            show_mask = self.assembly_display.source_show_mask()
+            modify_indices = modify_indices[show_mask[modify_indices]]
+            if not modify_indices.size:
+                raise ValueError("筛选范围内没有处于“显示”状态的节点，数据未修改。")
+
         targets = self._node_filter_targets(process_fom, process_rom)
 
         if frame_number is not None:
@@ -4397,6 +4533,8 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
             )
         if removed_errors:
             message += f" 已移除 {len(removed_errors)} 个失效误差场，请重新生成。"
+        if self.assembly_display.active:
+            message += " 仅处理处于“显示”状态的实例，透明和隐藏实例的节点未修改。"
         self.statusBar().showMessage(message, 8000)
         return message
 
@@ -4665,6 +4803,8 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         coordinates = _coords_3d(self.coords)
         for model_name, side, field_name, values in sources:
             valid_mask = np.isfinite(values)
+            if settings["scope"] == "visible" and self.assembly_display.active:
+                valid_mask &= self.assembly_display.source_show_mask()
             if visible_threshold is not None:
                 valid_mask &= self._filter_keep_mask(values, visible_threshold)
             selected_indices = self._extreme_source_indices(
@@ -5743,6 +5883,10 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         self.node_ids = new_node_ids
         self.coords = new_coords
         self.elements = new_elements
+        self.assembly_display.reset(
+            _LAST_INP_READ_REPORT.get("display_objects", []), len(new_node_ids))
+        if self.assembly_display_dialog is not None:
+            self.assembly_display_dialog.refresh()
 
         self.fields.clear()
         self.rom_fields.clear()
@@ -6318,6 +6462,7 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
     def safe_render_both(self):
         if getattr(self, "_closing", False):
             return
+        self.assembly_display.update()
         self.safe_render(self.vtk_left)
         self.safe_render(self.vtk_right)
 
@@ -6389,7 +6534,11 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
 
 
 if __name__ == "__main__":
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ODBVisualizer.VTKVisualizer")
     app = QtWidgets.QApplication(sys.argv)
+    app.setWindowIcon(QIcon(str(Path(__file__).resolve().parent / "assets" / "vtk.ico")))
     install_application_fonts(app)
     win = VTKCompareWindow()
     win.show()

@@ -14,7 +14,504 @@ from PyQt5.QtWidgets import QFileDialog
 from PyQt5.QtGui import QIcon
 import vtk
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
-from script.assembly_display import AssemblyDisplayController
+import time
+from vtk.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray, vtk_to_numpy
+
+# 数值分析的实例范围选择
+class InstanceSelectionDialog(QtWidgets.QDialog):
+    def __init__(self, objects, selected, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("选择实例")
+        self.resize(460, 420)
+        layout = QtWidgets.QVBoxLayout(self)
+        self.search = QtWidgets.QLineEdit(self)
+        self.search.setPlaceholderText("搜索实例名称")
+        layout.addWidget(self.search)
+        self.items = QtWidgets.QListWidget(self)
+        for index, obj in enumerate(objects):
+            count = obj["node_end"] - obj["node_start"]
+            item = QtWidgets.QListWidgetItem(f"{obj['name']}（{count} 个节点）")
+            item.setData(QtCore.Qt.UserRole, index)
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.Checked if index in selected else QtCore.Qt.Unchecked)
+            self.items.addItem(item)
+        layout.addWidget(self.items)
+        self.search.textChanged.connect(self._search)
+        row = QtWidgets.QHBoxLayout()
+        for text, checked in (("全选", True), ("清空", False)):
+            button = QtWidgets.QPushButton(text, self)
+            button.clicked.connect(lambda _=False, value=checked: self._check_all(value))
+            row.addWidget(button)
+        row.addStretch(1)
+        for text, slot in (("取消", self.reject), ("确定", self.accept)):
+            button = QtWidgets.QPushButton(text, self)
+            button.clicked.connect(slot)
+            row.addWidget(button)
+        layout.addLayout(row)
+
+    def _search(self, text):
+        for index in range(self.items.count()):
+            item = self.items.item(index)
+            item.setHidden(text.casefold() not in item.text().casefold())
+
+    def _check_all(self, checked):
+        for index in range(self.items.count()):
+            self.items.item(index).setCheckState(
+                QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked)
+
+    def selected_indices(self):
+        return {self.items.item(index).data(QtCore.Qt.UserRole)
+                for index in range(self.items.count())
+                if self.items.item(index).checkState() == QtCore.Qt.Checked}
+
+    def accept(self):
+        if not self.selected_indices():
+            QtWidgets.QMessageBox.warning(self, "尚未选择实例", "请至少选择一个实例。")
+            return
+        super().accept()
+
+
+class InstanceScopeWidget(QtWidgets.QWidget):
+    changed = QtCore.pyqtSignal()
+
+    def __init__(self, owner, parent=None):
+        super().__init__(parent)
+        self.owner = owner
+        self.selected = set()
+        row = QtWidgets.QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(QtWidgets.QLabel("实例范围：", self))
+        self.mode = QtWidgets.QComboBox(self)
+        self.mode.addItems(["全部实例", "指定实例"])
+        row.addWidget(self.mode)
+        self.choose_button = QtWidgets.QPushButton("选择实例…", self)
+        row.addWidget(self.choose_button)
+        self.summary = QtWidgets.QLabel(self)
+        row.addWidget(self.summary, 1)
+        self.mode.currentIndexChanged.connect(self._changed)
+        self.choose_button.clicked.connect(self._choose)
+        self._update_summary()
+
+    def objects(self):
+        return self.owner.assembly_display.objects
+
+    def _update_summary(self):
+        specified = self.mode.currentIndex() == 1
+        self.choose_button.setEnabled(specified)
+        objects = self.objects()
+        indices = self.selected if specified else set(range(len(objects)))
+        chosen = [obj for index, obj in enumerate(objects) if index in indices]
+        count = sum(obj["node_end"] - obj["node_start"] for obj in chosen)
+        self.summary.setText(
+            (f"已选 {len(chosen)} 个实例，共 {count} 个节点" if specified else
+             f"全部 {len(chosen)} 个实例，共 {count} 个节点") if chosen else
+            ("尚未选择实例" if specified else "请先加载 INP 文件"))
+        self.summary.setToolTip("\n".join(obj["name"] for obj in chosen))
+
+    def _changed(self):
+        self._update_summary()
+        self.changed.emit()
+
+    def _choose(self):
+        dialog = InstanceSelectionDialog(self.objects(), self.selected, self)
+        if dialog.exec_() == QtWidgets.QDialog.Accepted:
+            selected = dialog.selected_indices()
+            if selected != self.selected:
+                self.selected = selected
+                self._changed()
+
+    def reset(self):
+        self.mode.blockSignals(True)
+        self.mode.setCurrentIndex(0)
+        self.mode.blockSignals(False)
+        self.selected.clear()
+        self._changed()
+
+    def node_indices(self, node_count):
+        if node_count != len(self.owner.assembly_display.node_owners):
+            raise ValueError("物理场节点数量与当前 INP 模型不一致。")
+        if self.mode.currentIndex() == 0:
+            indices = np.arange(node_count, dtype=np.int64)
+        else:
+            indices = np.flatnonzero(np.isin(
+                self.owner.assembly_display.node_owners, list(self.selected)))
+        if not indices.size:
+            raise ValueError("请至少选择一个有效实例。")
+        return indices
+
+    def description(self):
+        if self.mode.currentIndex() == 0:
+            return "全部实例"
+        return "指定实例：" + "、".join(
+            obj["name"] for index, obj in enumerate(self.objects()) if index in self.selected)
+
+
+# 物理场分块读取及进度反馈
+class FieldLoadCancelled(Exception):
+    pass
+
+
+def check_cancel(cancelled):
+    if cancelled is not None and cancelled():
+        raise FieldLoadCancelled()
+
+
+class ProgressFile:
+    def __init__(self, stream, progress, cancelled):
+        self.stream = stream
+        self.progress = progress
+        self.cancelled = cancelled
+        self.size = max(os.fstat(stream.fileno()).st_size, 1)
+        self.last_update = 0.0
+
+    def read(self, size=-1):
+        check_cancel(self.cancelled)
+        result = self.stream.read(size)
+        now = time.monotonic()
+        if self.progress and (now - self.last_update >= 0.1 or not result):
+            self.progress(min(self.stream.tell() / self.size, 1.0), "读取 CSV")
+            self.last_update = now
+        return result
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+    def read1(self, size=-1):
+        # pandas 的文本适配层在部分版本使用 read1 而不是 read。
+        return self.read(size)
+
+
+def load_npy(path, progress=None, cancelled=None):
+    check_cancel(cancelled)
+    try:
+        mapped = np.load(path, mmap_mode="r", allow_pickle=False)
+    except ValueError:
+        # 字典/对象数组不能映射，反序列化期间不伪造百分比。
+        if progress:
+            progress(None, "解析 NPY 对象数据（此阶段无法估算进度）")
+        result = np.load(path, allow_pickle=True)
+        check_cancel(cancelled)
+        return result
+    try:
+        result = np.empty(mapped.shape, dtype=mapped.dtype, order="F" if mapped.flags.f_contiguous else "C")
+        source = mapped.ravel(order="K")
+        target = result.ravel(order="K")
+        chunk = max(1, (8 * 1024 * 1024) // max(mapped.dtype.itemsize, 1))
+        last_update = 0.0
+        for start in range(0, source.size, chunk):
+            check_cancel(cancelled)
+            end = min(start + chunk, source.size)
+            target[start:end] = source[start:end]
+            now = time.monotonic()
+            if progress and (now - last_update >= 0.1 or end == source.size):
+                progress(end / source.size, "读取 NPY")
+                last_update = now
+        return result
+    finally:
+        # 返回普通数组，不长期持有 Windows 文件映射锁。
+        if getattr(mapped, "_mmap", None) is not None:
+            mapped._mmap.close()
+
+
+# 装配实例显示
+class AssemblyDisplayController:
+    def __init__(self, owner, edge_builder):
+        self.owner = owner
+        self.edge_builder = edge_builder
+        self.objects = []
+        self.states = {}
+        self.node_owners = np.empty(0, dtype=np.int64)
+        self.cache = {}
+
+    @property
+    def active(self):
+        return any(state != "show" for state in self.states.values())
+
+    def invalidate(self):
+        for entries in self.cache.values():
+            for entry in entries.values():
+                for actor in entry["actors"]:
+                    entry["renderer"].RemoveActor(actor)
+        self.cache.clear()
+
+    def reset(self, objects, node_count):
+        self.invalidate()
+        self.objects = [dict(item) for item in objects]
+        if not self.objects and node_count:
+            self.objects = [{"name": "模型", "node_start": 0, "node_end": node_count}]
+        self.states = {index: "show" for index in range(len(self.objects))}
+        self.node_owners = np.full(node_count, -1, dtype=np.int64)
+        for index, item in enumerate(self.objects):
+            self.node_owners[item["node_start"]:item["node_end"]] = index
+
+    def source_show_mask(self):
+        result = np.ones(len(self.node_owners), dtype=bool)
+        for index, state in self.states.items():
+            if state != "show":
+                result[self.node_owners == index] = False
+        return result
+
+    def set_states(self, states):
+        if any(value not in ("show", "transparent", "hidden") for value in states.values()):
+            raise ValueError("未知的装配显示状态。")
+        self.states = {index: states.get(index, "show") for index in range(len(self.objects))}
+
+    def _partition(self, dataset, source_indices, renderer, slot):
+        if dataset is None:
+            return {}
+        key = (slot.split("_")[0] + "_", dataset.GetAddressAsString(""), dataset.GetNumberOfCells(),
+               dataset.GetNumberOfPoints())
+        if key in self.cache:
+            return self.cache[key]
+        if source_indices is None:
+            source_indices = np.arange(dataset.GetNumberOfPoints(), dtype=np.int64)
+        source_indices = np.asarray(source_indices, dtype=np.int64)
+        if len(source_indices) != dataset.GetNumberOfPoints():
+            raise ValueError("装配显示网格与源节点映射数量不一致。")
+        point_owners = self.node_owners[source_indices]
+        if isinstance(dataset, vtk.vtkUnstructuredGrid) and dataset.GetNumberOfCells():
+            cells = dataset.GetCells()
+            offsets = vtk_to_numpy(cells.GetOffsetsArray())
+            connectivity = vtk_to_numpy(cells.GetConnectivityArray())
+            cell_owners = point_owners[connectivity[offsets[:-1]]]
+        else:
+            cell_owners = np.asarray([
+                point_owners[dataset.GetCell(index).GetPointId(0)]
+                for index in range(dataset.GetNumberOfCells())
+            ], dtype=np.int64)
+        tagged = dataset.NewInstance()
+        tagged.ShallowCopy(dataset)
+        point_ids = numpy_to_vtkIdTypeArray(
+            np.arange(dataset.GetNumberOfPoints(), dtype=np.int64), deep=True)
+        point_ids.SetName("_AssemblyDisplayPointIndex")
+        tagged.GetPointData().AddArray(point_ids)
+        entries = {}
+        for index in np.unique(cell_owners):
+            if index < 0:
+                continue
+            selection = vtk.vtkIdList()
+            for cell_id in np.flatnonzero(cell_owners == index):
+                selection.InsertNextId(int(cell_id))
+            extract = vtk.vtkExtractCells()
+            extract.SetInputData(tagged)
+            extract.SetCellList(selection)
+            extract.Update()
+            geometry = vtk.vtkUnstructuredGrid()
+            geometry.DeepCopy(extract.GetOutput())
+            ids = vtk_to_numpy(
+                geometry.GetPointData().GetArray("_AssemblyDisplayPointIndex")).copy()
+            entries[int(index)] = {
+                "geometry": geometry, "point_ids": ids, "renderer": renderer,
+                "actors": [], "surface": None, "wire": None, "outline": None,
+                "feature_edges": None, "surface_mesh": None,
+                "scalar_key": False,
+            }
+        self.cache[key] = entries
+        return entries
+
+    def _surface(self, entry):
+        if entry["surface"] is None:
+            mapper = vtk.vtkDataSetMapper()
+            mapper.SetInputData(entry["geometry"])
+            mapper.SetScalarModeToUsePointData()
+            mapper.SetColorModeToMapScalars()
+            actor = vtk.vtkActor()
+            actor.SetMapper(mapper)
+            entry["renderer"].AddActor(actor)
+            entry["actors"].append(actor)
+            entry["surface"] = actor
+        return entry["surface"]
+
+    def _wire(self, entry):
+        if entry["wire"] is None:
+            mapper = vtk.vtkPolyDataMapper()
+            mapper.SetInputData(self.edge_builder(entry["geometry"]))
+            mapper.ScalarVisibilityOff()
+            mapper.SetResolveCoincidentTopologyToPolygonOffset()
+            mapper.SetRelativeCoincidentTopologyLineOffsetParameters(0.0, -2.0)
+            actor = vtk.vtkActor()
+            actor.SetMapper(mapper)
+            entry["renderer"].AddActor(actor)
+            entry["actors"].append(actor)
+            entry["wire"] = actor
+        return entry["wire"]
+
+    def _surface_mesh(self, entry):
+        if entry["surface_mesh"] is None:
+            surface = vtk.vtkDataSetSurfaceFilter()
+            surface.SetInputData(entry["geometry"])
+            clean = vtk.vtkCleanPolyData()
+            clean.SetInputConnection(surface.GetOutputPort())
+            clean.SetTolerance(0.0)
+            clean.PointMergingOn()
+            clean.Update()
+            mesh = vtk.vtkPolyData()
+            mesh.DeepCopy(clean.GetOutput())
+            entry["surface_mesh"] = mesh
+        return entry["surface_mesh"]
+
+    def _feature_edges(self, entry):
+        if entry["feature_edges"] is None:
+            edges = vtk.vtkFeatureEdges()
+            edges.SetInputData(self._surface_mesh(entry))
+            edges.FeatureEdgesOn()
+            edges.SetFeatureAngle(30.0)
+            edges.BoundaryEdgesOff()
+            edges.ManifoldEdgesOff()
+            edges.NonManifoldEdgesOff()
+            edges.ColoringOff()
+            mapper = vtk.vtkPolyDataMapper()
+            mapper.SetInputConnection(edges.GetOutputPort())
+            mapper.ScalarVisibilityOff()
+            actor = vtk.vtkActor()
+            actor.SetMapper(mapper)
+            actor.SetPickable(False)
+            entry["renderer"].AddActor(actor)
+            entry["actors"].append(actor)
+            entry["feature_edges"] = actor
+        return entry["feature_edges"]
+
+    def _outline(self, entry):
+        if entry["outline"] is None:
+            silhouette = vtk.vtkPolyDataSilhouette()
+            silhouette.SetInputData(self._surface_mesh(entry))
+            silhouette.SetCamera(entry["renderer"].GetActiveCamera())
+            silhouette.SetEnableFeatureAngle(False)
+            silhouette.SetBorderEdges(True)
+            mapper = vtk.vtkPolyDataMapper()
+            mapper.SetInputConnection(silhouette.GetOutputPort())
+            mapper.ScalarVisibilityOff()
+            actor = vtk.vtkActor()
+            actor.SetMapper(mapper)
+            actor.SetPickable(False)
+            entry["renderer"].AddActor(actor)
+            entry["actors"].append(actor)
+            entry["outline"] = actor
+        return entry["outline"]
+
+    def _sync_surface(self, entry, dataset, base_actor, base_mapper):
+        scalars = dataset.GetPointData().GetScalars()
+        scalar_key = (scalars.GetAddressAsString(""), scalars.GetMTime()) if scalars else None
+        if scalar_key != entry["scalar_key"]:
+            if scalars is None:
+                entry["geometry"].GetPointData().SetScalars(None)
+            else:
+                values = numpy_to_vtk(vtk_to_numpy(scalars)[entry["point_ids"]], deep=True)
+                values.SetName(scalars.GetName() or "field")
+                entry["geometry"].GetPointData().SetScalars(values)
+            entry["scalar_key"] = scalar_key
+        actor = self._surface(entry)
+        actor.GetProperty().DeepCopy(base_actor.GetProperty())
+        mapper = actor.GetMapper()
+        mapper.SetLookupTable(base_mapper.GetLookupTable())
+        mapper.SetScalarRange(*base_mapper.GetScalarRange())
+        mapper.SetScalarVisibility(
+            base_mapper.GetScalarVisibility() and scalars is not None)
+        actor.SetVisibility(actor.GetProperty().GetOpacity() > 1.0e-6)
+
+    def _stable_wire_color(self, renderer):
+        color = np.asarray(renderer.GetBackground())
+        if renderer.GetGradientBackground():
+            color = (color + np.asarray(renderer.GetBackground2())) * 0.5
+        return (0.95, 0.95, 0.95) if np.mean(color) < 0.45 else (0.12, 0.14, 0.16)
+
+    def update(self):
+        owner = self.owner
+        if not self.objects or getattr(owner, "grid_l", None) is None:
+            return
+        for entries in self.cache.values():
+            for entry in entries.values():
+                for actor in entry["actors"]:
+                    actor.VisibilityOff()
+        if not self.active:
+            owner._ensure_wireframe_ready()
+            for side in ("l", "r"):
+                getattr(owner, "actor_" + side).SetVisibility(
+                    owner._rotational_surface_opacity() > 1.0e-6)
+                getattr(owner, "wire_actor_" + side).SetVisibility(
+                    owner._wire_should_be_visible())
+                cap = getattr(owner, "cap_actor_" + side)
+                if cap is not None:
+                    cap.SetVisibility(owner.is_rotational_surface)
+                outline = getattr(owner, "outline_actor_" + side)
+                if outline is not None:
+                    outline.SetVisibility(owner._rotational_outline_should_be_visible())
+            return
+        for side in ("l", "r"):
+            grid = getattr(owner, "grid_" + side)
+            renderer = getattr(owner, "ren_" + side)
+            sources = getattr(owner, "display_source_indices_" + side)
+            for prefix in ("actor_", "wire_actor_", "cap_actor_", "outline_actor_"):
+                actor = getattr(owner, prefix + side, None)
+                if actor is not None:
+                    actor.VisibilityOff()
+            # 主体、剖面和外表面网格分别分组，沿用旋转显示设置。
+            main_entries = self._partition(grid, sources, renderer, side + "_main")
+            surface_grid = (
+                getattr(owner, "rotational_side_grid_" + side)
+                if owner.is_rotational_surface else grid)
+            surface_entries = self._partition(
+                surface_grid, sources, renderer, side + "_surface")
+            cap_grid = getattr(owner, "cap_grid_" + side)
+            cap_entries = self._partition(cap_grid, sources, renderer, side + "_cap")
+            wire_grid = owner._wire_source_grids()[0 if side == "l" else 1]
+            wire_entries = self._partition(wire_grid, sources, renderer, side + "_wire")
+            for index, state in self.states.items():
+                if state == "hidden":
+                    continue
+                if state == "transparent":
+                    entry = main_entries.get(index)
+                    if entry is not None:
+                        actor = self._outline(entry)
+                        actor.GetProperty().SetColor(*self._stable_wire_color(renderer))
+                        actor.GetProperty().SetOpacity(1.0)
+                        actor.GetProperty().SetLineWidth(1.6)
+                        actor.GetProperty().LightingOff()
+                        actor.VisibilityOn()
+                        features = self._feature_edges(entry)
+                        features.GetProperty().SetColor(*self._stable_wire_color(renderer))
+                        features.GetProperty().SetOpacity(0.65)
+                        features.GetProperty().SetLineWidth(0.8)
+                        features.GetProperty().LightingOff()
+                        features.VisibilityOn()
+                    continue
+                entry = surface_entries.get(index)
+                if entry is not None:
+                    self._sync_surface(
+                        entry, surface_grid, getattr(owner, "actor_" + side),
+                        getattr(owner, "mapper_" + side))
+                cap_entry = cap_entries.get(index)
+                if cap_entry is not None and getattr(owner, "cap_actor_" + side) is not None:
+                    self._sync_surface(
+                        cap_entry, cap_grid, getattr(owner, "cap_actor_" + side),
+                        getattr(owner, "cap_mapper_" + side))
+                if owner._wire_should_be_visible() and index in wire_entries:
+                    actor = self._wire(wire_entries[index])
+                    actor.GetProperty().DeepCopy(
+                        getattr(owner, "wire_actor_" + side).GetProperty())
+                    actor.VisibilityOn()
+                if owner._rotational_outline_should_be_visible() and entry is not None:
+                    actor = self._outline(entry)
+                    original = getattr(owner, "outline_actor_" + side)
+                    if original is not None:
+                        actor.GetProperty().DeepCopy(original.GetProperty())
+                    actor.VisibilityOn()
+
+    def pick_targets(self, side):
+        if not self.active:
+            return [(getattr(self.owner, "actor_" + side),
+                     getattr(self.owner, "grid_" + side), None)]
+        targets = []
+        for key, entries in self.cache.items():
+            if not key[0].startswith(side + "_"):
+                continue
+            for index, entry in entries.items():
+                state = self.states[index]
+                actor = entry["surface"] if state == "show" else None
+                if actor is not None and actor.GetVisibility():
+                    targets.append((actor, entry["geometry"], entry["point_ids"]))
+        return targets
+
 
 VTK_OUTPUT_WINDOW = vtk.vtkOutputWindow()
 vtk.vtkOutputWindow.SetInstance(VTK_OUTPUT_WINDOW)
@@ -492,8 +989,12 @@ def read_inp_elements(inp_path):
     return elements
 
 
-def read_field_csv(csv_path, node_count):
-    df = pd.read_csv(csv_path) 
+def read_field_csv(csv_path, node_count, progress=None, cancelled=None):
+    with open(csv_path, "rb") as stream:
+        df = pd.read_csv(ProgressFile(stream, progress, cancelled))
+    check_cancel(cancelled)
+    if progress:
+        progress(None, "转换 CSV 数值并校验节点")
     if df.shape[1] < 2: 
         raise ValueError(f"CSV 列数太少：{csv_path}")
 
@@ -536,8 +1037,8 @@ def _normalize_field_data_array(data, node_count, source_path):
     return data
 
 
-def read_field_npy(npy_path, node_count):
-    loaded = np.load(npy_path, allow_pickle=True)
+def read_field_npy(npy_path, node_count, progress=None, cancelled=None):
+    loaded = load_npy(npy_path, progress, cancelled)
     field_name = os.path.splitext(os.path.basename(npy_path))[0]
     frames = None
 
@@ -554,6 +1055,9 @@ def read_field_npy(npy_path, node_count):
     else:
         data = loaded
 
+    if progress:
+        progress(None, "校验 NPY 节点和帧")
+    check_cancel(cancelled)
     data = _normalize_field_data_array(data, node_count, npy_path)
     if frames is None:
         frames = np.arange(data.shape[0], dtype=int).astype(str)
@@ -566,12 +1070,12 @@ def read_field_npy(npy_path, node_count):
     return field_name, data, frames
 
 
-def read_field_file(path, node_count):
+def read_field_file(path, node_count, progress=None, cancelled=None):
     suffix = os.path.splitext(path)[1].lower()
     if suffix == ".csv":
-        return read_field_csv(path, node_count)
+        return read_field_csv(path, node_count, progress, cancelled)
     if suffix == ".npy":
-        return read_field_npy(path, node_count)
+        return read_field_npy(path, node_count, progress, cancelled)
     raise ValueError(f"不支持的物理场文件格式：{suffix}")
 
 def create_abaqus_lut():
@@ -734,24 +1238,49 @@ class CsvLoadWorker(QtCore.QObject):
             start = int(index * 100 / total)
             self.progress.emit(start, f"正在读取 {filename}（{index + 1}/{total}）")
             try:
-                name, data, frames = read_field_file(path, self.node_count)
+                def report(fraction, stage):
+                    value = -1 if fraction is None else int((index + 0.8 * fraction) * 100 / total)
+                    self.progress.emit(value, f"{stage}：{filename}（{index + 1}/{total}）")
+
+                name, data, frames = read_field_file(
+                    path, self.node_count, report, lambda: self.cancel_requested)
                 if self.cancel_requested:
                     break
                 self.progress.emit(
                     int((index + 0.8) * 100 / total),
                     f"正在统计 {filename} 的数值范围",
                 )
+                minimum, maximum = np.inf, -np.inf
+                # 按帧分块统计，避免大场的范围统计长时间没有反馈。
+                rows_per_chunk = max(1, 1000000 // max(data.shape[1], 1))
+                last_progress = -1
+                for row_start in range(0, len(data), rows_per_chunk):
+                    check_cancel(lambda: self.cancel_requested)
+                    block = data[row_start:row_start + rows_per_chunk]
+                    if np.any(~np.isnan(block)):
+                        minimum = min(minimum, float(np.nanmin(block)))
+                        maximum = max(maximum, float(np.nanmax(block)))
+                    fraction = min(row_start + rows_per_chunk, len(data)) / len(data)
+                    value = int((index + 0.8 + 0.19 * fraction) * 100 / total)
+                    if value != last_progress:
+                        self.progress.emit(value,
+                                           f"正在统计 {filename} 的数值范围（{fraction:.0%}）")
+                        last_progress = value
+                if minimum == np.inf and maximum == -np.inf:
+                    minimum = maximum = np.nan
                 results.append(
                     (
                         name,
                         {
                             "data": data,
                             "frames": frames,
-                            "vmin": float(np.nanmin(data)),
-                            "vmax": float(np.nanmax(data)),
+                            "vmin": minimum,
+                            "vmax": maximum,
                         },
                     )
                 )
+            except FieldLoadCancelled:
+                break
             except Exception as exc:
                 errors.append((path, str(exc)))
             self.progress.emit(int((index + 1) * 100 / total), f"已处理 {filename}")
@@ -888,12 +1417,14 @@ class TemporalConsistencyWorker(QtCore.QObject):
     progress = QtCore.pyqtSignal(int, str)
     finished = QtCore.pyqtSignal(object, object, bool)
 
-    def __init__(self, fom_field, rom_field, pairs, metric_keys):
+    def __init__(self, fom_field, rom_field, pairs, metric_keys, node_indices=None):
         super().__init__()
         self.fom_field = fom_field
         self.rom_field = rom_field
         self.pairs = list(pairs)
         self.metric_keys = tuple(metric_keys)
+        self.node_indices = (slice(None) if node_indices is None else
+                             np.asarray(node_indices, dtype=np.int64).copy())
         self.cancel_requested = False
 
     def cancel(self):
@@ -920,7 +1451,7 @@ class TemporalConsistencyWorker(QtCore.QObject):
                 for position, (fom_index, _rom_index) in enumerate(self.pairs):
                     if self.cancel_requested:
                         break
-                    reference = np.asarray(fom_data[fom_index], dtype=float)
+                    reference = np.asarray(fom_data[fom_index][self.node_indices], dtype=float)
                     finite = reference[np.isfinite(reference)]
                     if finite.size:
                         reference_min = min(reference_min, float(np.min(finite)))
@@ -937,8 +1468,8 @@ class TemporalConsistencyWorker(QtCore.QObject):
             for position, (fom_index, rom_index) in enumerate(self.pairs):
                 if self.cancel_requested:
                     break
-                reference = np.asarray(fom_data[fom_index], dtype=float)
-                prediction = np.asarray(rom_data[rom_index], dtype=float)
+                reference = np.asarray(fom_data[fom_index][self.node_indices], dtype=float)
+                prediction = np.asarray(rom_data[rom_index][self.node_indices], dtype=float)
                 valid = np.isfinite(reference) & np.isfinite(prediction)
                 valid_count = int(np.count_nonzero(valid))
                 metric_values = {key: np.nan for key in self.metric_keys}
@@ -1005,6 +1536,10 @@ class BackgroundTaskUiBridge(QtCore.QObject):
         if self.owner._closing or self.task.get("discarded", False):
             return
         self.progress.setLabelText(message)
+        self.progress.setRange(0, 0 if value < 0 else 100)
+        if value < 0:
+            self.owner.statusBar().showMessage(message)
+            return
         self.progress.setValue(int(value))
         self.owner.statusBar().showMessage(message)
 
@@ -1822,12 +2357,15 @@ class ExtremeQueryDialog(QtWidgets.QDialog):
         controls.addStretch(1)
         root_layout.addLayout(controls)
 
+        self.instance_scope = InstanceScopeWidget(self.owner, self)
+        root_layout.addWidget(self.instance_scope)
+
         self.context_label = QtWidgets.QLabel("当前字段/帧：--", self)
         root_layout.addWidget(self.context_label)
 
-        self.result_table = QtWidgets.QTableWidget(0, 7, self)
+        self.result_table = QtWidgets.QTableWidget(0, 8, self)
         self.result_table.setHorizontalHeaderLabels(
-            ["模型", "极值类型", "节点编号", "数值", "x", "y", "z"]
+            ["模型", "实例名称", "极值类型", "节点编号", "数值", "x", "y", "z"]
         )
         self.result_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.result_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
@@ -1850,6 +2388,14 @@ class ExtremeQueryDialog(QtWidgets.QDialog):
         clear_button.clicked.connect(self.owner.clear_extreme_markers)
         close_button.clicked.connect(self.hide)
         root_layout.addWidget(buttons)
+        self.instance_scope.changed.connect(self._instance_scope_changed)
+
+    def _instance_scope_changed(self):
+        self.owner._remove_extreme_actors()
+        self.set_results([], "实例范围已更改，请重新查询。")
+        self.owner.safe_render_both()
+        if self.auto_update_check.isChecked():
+            self.owner.run_extreme_query()
 
     def settings(self):
         return {
@@ -1880,6 +2426,7 @@ class ExtremeQueryDialog(QtWidgets.QDialog):
         for row_index, row in enumerate(normalized_rows):
             values = [
                 row["model"],
+                row.get("instance_name", "--"),
                 row["type_label"],
                 str(row["node_id"]),
                 f"{row['value']:.6e}",
@@ -1923,7 +2470,8 @@ class ExtremeQueryDialog(QtWidgets.QDialog):
             return
         result = self.result_rows[row]
         text = (
-            f"{result['model']}\t{result['type_label']}\t{result['node_id']}\t"
+            f"{result['model']}\t{result.get('instance_name', '--')}\t"
+            f"{result['type_label']}\t{result['node_id']}\t"
             f"{result['value']:.6e}\t{result['x']:.6f}\t"
             f"{result['y']:.6f}\t{result['z']:.6f}"
         )
@@ -1963,6 +2511,9 @@ class GlobalConsistencyDialog(QtWidgets.QDialog):
         fields.addRow("全阶模型物理场：", self.fom_combo)
         fields.addRow("降阶模型物理场：", self.rom_combo)
         root.addLayout(fields)
+
+        self.instance_scope = InstanceScopeWidget(self.owner, self)
+        root.addWidget(self.instance_scope)
 
         node_row = QtWidgets.QHBoxLayout()
         self.node_check = QtWidgets.QCheckBox("计算指定节点", self)
@@ -2016,6 +2567,11 @@ class GlobalConsistencyDialog(QtWidgets.QDialog):
         analyze_button.clicked.connect(self.analyze)
         close_button.clicked.connect(self.hide)
         root.addWidget(buttons)
+        self.instance_scope.changed.connect(self._instance_scope_changed)
+
+    def _instance_scope_changed(self):
+        self.result_table.setRowCount(0)
+        self.summary_label.setText("实例范围已更改，请重新点击“分析”。")
 
     def refresh_fields(self):
         old_fom = self.fom_combo.currentText()
@@ -2120,9 +2676,12 @@ class GlobalConsistencyDialog(QtWidgets.QDialog):
 
         fom_indices = [pair[0] for pair in pairs]
         rom_indices = [pair[1] for pair in pairs]
-        reference = np.asarray(fom_field["data"][fom_indices], dtype=float)
-        prediction = np.asarray(rom_field["data"][rom_indices], dtype=float)
-        scope_text = "全场"
+        try:
+            node_indices = self.instance_scope.node_indices(fom_field["data"].shape[1])
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(self, "实例范围无效", str(exc))
+            return
+        scope_text = self.instance_scope.description()
         if self.node_check.isChecked():
             node_text = self.node_input.text().strip()
             if not node_text:
@@ -2134,9 +2693,14 @@ class GlobalConsistencyDialog(QtWidgets.QDialog):
                 QtWidgets.QMessageBox.warning(self, "无法分析", f"未找到节点编号 {node_id}。")
                 return
             node_index = int(positions[0])
-            reference = reference[:, node_index]
-            prediction = prediction[:, node_index]
-            scope_text = f"节点 {node_id}"
+            if node_index not in node_indices:
+                QtWidgets.QMessageBox.warning(self, "无法分析", "该节点不属于所选实例范围。")
+                return
+            node_indices = np.asarray([node_index], dtype=np.int64)
+            scope_text += f"，节点 {node_id}"
+
+        reference = np.asarray(fom_field["data"][np.ix_(fom_indices, node_indices)], dtype=float)
+        prediction = np.asarray(rom_field["data"][np.ix_(rom_indices, node_indices)], dtype=float)
 
         try:
             results, valid_count, invalid_count, zero_reference_count = calculate_error_metrics(
@@ -2620,6 +3184,8 @@ class TemporalConsistencyDialog(QtWidgets.QDialog):
         self._result_interval = 1.0
         self._result_unit = ""
         self._busy = False
+        self._scope_revision = 0
+        self._result_scope_text = "全部实例"
         self._plot_font = LocalConsistencyDialog._make_plot_font(FONT_MEDIUM_NAME)
 
         root = QtWidgets.QVBoxLayout(self)
@@ -2632,7 +3198,10 @@ class TemporalConsistencyDialog(QtWidgets.QDialog):
         self.rom_combo = QtWidgets.QComboBox(self)
         form.addWidget(self.rom_combo, 0, 3)
 
-        form.addWidget(QtWidgets.QLabel("帧间隔：", self), 1, 0)
+        self.instance_scope = InstanceScopeWidget(self.owner, self)
+        form.addWidget(self.instance_scope, 1, 0, 1, 4)
+
+        form.addWidget(QtWidgets.QLabel("帧间隔：", self), 2, 0)
         interval_row = QtWidgets.QHBoxLayout()
         self.frame_interval_input = QtWidgets.QLineEdit("1", self)
         validator = QtGui.QDoubleValidator(0.0, 1.0e15, 12, self)
@@ -2643,9 +3212,9 @@ class TemporalConsistencyDialog(QtWidgets.QDialog):
         interval_row.addWidget(self.frame_interval_input, 2)
         interval_row.addWidget(QtWidgets.QLabel("单位：", self))
         interval_row.addWidget(self.time_unit_input, 1)
-        form.addLayout(interval_row, 1, 1)
+        form.addLayout(interval_row, 2, 1)
 
-        form.addWidget(QtWidgets.QLabel("处理范围：", self), 1, 2)
+        form.addWidget(QtWidgets.QLabel("处理范围：", self), 2, 2)
         range_row = QtWidgets.QHBoxLayout()
         self.frame_range_check = QtWidgets.QCheckBox("指定帧", self)
         self.start_frame_input = QtWidgets.QSpinBox(self)
@@ -2658,7 +3227,7 @@ class TemporalConsistencyDialog(QtWidgets.QDialog):
         range_row.addWidget(self.start_frame_input)
         range_row.addWidget(QtWidgets.QLabel("到", self))
         range_row.addWidget(self.end_frame_input)
-        form.addLayout(range_row, 1, 3)
+        form.addLayout(range_row, 2, 3)
 
         metric_group = QtWidgets.QGroupBox("逐帧空间误差指标", self)
         metric_layout = QtWidgets.QHBoxLayout(metric_group)
@@ -2669,7 +3238,7 @@ class TemporalConsistencyDialog(QtWidgets.QDialog):
             self.metric_checks[key] = check
             metric_layout.addWidget(check)
         metric_layout.addStretch(1)
-        form.addWidget(metric_group, 2, 0, 1, 4)
+        form.addWidget(metric_group, 3, 0, 1, 4)
 
         ranking_row = QtWidgets.QHBoxLayout()
         ranking_row.addWidget(QtWidgets.QLabel("异常时刻主指标：", self))
@@ -2682,7 +3251,7 @@ class TemporalConsistencyDialog(QtWidgets.QDialog):
         ranking_row.addWidget(self.top_count_spin)
         ranking_row.addWidget(QtWidgets.QLabel("帧", self))
         ranking_row.addStretch(1)
-        form.addLayout(ranking_row, 3, 0, 1, 4)
+        form.addLayout(ranking_row, 4, 0, 1, 4)
 
         button_row = QtWidgets.QHBoxLayout()
         self.status_label = QtWidgets.QLabel("请选择 FOM、ROM 物理场后点击“分析”。", self)
@@ -2697,7 +3266,7 @@ class TemporalConsistencyDialog(QtWidgets.QDialog):
         button_row.addWidget(self.analyze_button)
         button_row.addWidget(self.export_button)
         button_row.addWidget(close_button)
-        form.addLayout(button_row, 4, 0, 1, 4)
+        form.addLayout(button_row, 5, 0, 1, 4)
         root.addWidget(settings)
 
         self.figure = Figure(figsize=(8.5, 4.7), tight_layout=True)
@@ -2732,6 +3301,12 @@ class TemporalConsistencyDialog(QtWidgets.QDialog):
         self.top_count_spin.valueChanged.connect(self._refresh_results)
         self._refresh_rank_metrics()
         self._draw_empty_plot()
+
+        self.instance_scope.changed.connect(self._instance_scope_changed)
+
+    def _instance_scope_changed(self):
+        self.clear_results()
+        self.status_label.setText("实例范围已更改，请重新点击“分析”。")
 
     def _set_frame_range_enabled(self, checked):
         self.start_frame_input.setEnabled(checked)
@@ -2799,6 +3374,7 @@ class TemporalConsistencyDialog(QtWidgets.QDialog):
         self.canvas.draw_idle()
 
     def clear_results(self):
+        self._scope_revision += 1
         self._rows = []
         self._result_field_names = None
         self.result_table.setRowCount(0)
@@ -2824,6 +3400,7 @@ class TemporalConsistencyDialog(QtWidgets.QDialog):
             rom_field = self.owner.rom_fields[rom_name]
             if fom_field["data"].shape[1] != rom_field["data"].shape[1]:
                 raise ValueError("FOM 与 ROM 的节点数量不一致。")
+            node_indices = self.instance_scope.node_indices(fom_field["data"].shape[1])
             pairs, matching_note = GlobalConsistencyDialog._matched_frames(
                 fom_field, rom_field
             )
@@ -2843,13 +3420,15 @@ class TemporalConsistencyDialog(QtWidgets.QDialog):
         self.analyze_button.setEnabled(False)
         self.status_label.setText("正在后台计算逐帧误差…")
         epoch = self.owner._field_data_epoch
-        worker = TemporalConsistencyWorker(fom_field, rom_field, pairs, selected)
+        scope_revision = self._scope_revision
+        scope_text = self.instance_scope.description()
+        worker = TemporalConsistencyWorker(fom_field, rom_field, pairs, selected, node_indices)
         unit = self.time_unit_input.text().strip()
 
         def apply_results(rows, errors, cancelled):
             self._busy = False
             self.analyze_button.setEnabled(True)
-            if epoch != self.owner._field_data_epoch:
+            if epoch != self.owner._field_data_epoch or scope_revision != self._scope_revision:
                 return
             if errors:
                 QtWidgets.QMessageBox.warning(self, "分析失败", "\n".join(errors))
@@ -2862,6 +3441,7 @@ class TemporalConsistencyDialog(QtWidgets.QDialog):
             self._result_field_names = (fom_name, rom_name)
             self._result_interval = interval
             self._result_unit = unit
+            self._result_scope_text = scope_text
             self._matching_note = matching_note
             self._draw_plot(selected)
             self._refresh_results()
@@ -2908,6 +3488,10 @@ class TemporalConsistencyDialog(QtWidgets.QDialog):
         self.axes.tick_params(direction="in", top=True, right=True)
         self.axes.margins(x=0.03, y=0.08)
         self.axes.legend(handles=handles, prop=self._plot_font, frameon=False)
+        # 长实例名称保留在提示和导出中，图内只显示紧凑摘要。
+        self.axes.set_title(
+            self._result_scope_text if len(self._result_scope_text) <= 60 else
+            self._result_scope_text[:57] + "…", fontproperties=self._plot_font)
         for axis in (self.axes, self.percent_axes):
             if axis is not None:
                 for label in axis.get_xticklabels() + axis.get_yticklabels():
@@ -2968,7 +3552,7 @@ class TemporalConsistencyDialog(QtWidgets.QDialog):
                 item.setData(QtCore.Qt.UserRole, row["fom_index"])
                 self.result_table.setItem(position, column, item)
         self.status_label.setText(
-            f"{self._matching_note}；计算 {len(self._rows)} 帧；"
+            f"{self._result_scope_text}；{self._matching_note}；计算 {len(self._rows)} 帧；"
             f"主指标异常阈值 {threshold:.6g}"
             f"{' %' if key in self.PERCENT_METRICS else ''}；"
             f"全范围异常 {sum(row['metrics'][key] > threshold for row in candidates)} 帧。"
@@ -3003,6 +3587,7 @@ class TemporalConsistencyDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "无法导出", "请先完成时间一致性分析。")
             return
         columns = {
+            "Instance scope": [self._result_scope_text] * len(self._rows),
             "FOM frame": [row["fom_index"] + 1 for row in self._rows],
             "ROM frame": [row["rom_index"] + 1 for row in self._rows],
             "FOM frame label": [row["frame_label"] for row in self._rows],
@@ -4350,6 +4935,14 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
                 pass
         return np.array([0.0, -1.0, 0.0]), np.array([0.0, 0.0, 1.0])
 
+    def _refresh_analysis_field_choices(self):
+        """同步所有已创建浮窗，不要求关闭或重新打开窗口。"""
+        for name in ("global_consistency_dialog", "local_consistency_dialog",
+                     "temporal_consistency_dialog", "error_field_dialog"):
+            dialog = getattr(self, name, None)
+            if dialog is not None:
+                dialog.refresh_fields()
+
     def show_global_consistency_dialog(self):
         if self.global_consistency_dialog is None:
             self.global_consistency_dialog = GlobalConsistencyDialog(self)
@@ -4577,6 +5170,9 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         progress.setMinimumDuration(300)
         progress.setAutoClose(False)
         progress.setAutoReset(False)
+        if isinstance(worker, CsvLoadWorker):
+            progress.ensurePolished()
+            progress.setMinimumWidth(int(progress.sizeHint().width() * 1.45))
         worker.moveToThread(thread)
         task = {"thread": thread, "worker": worker, "progress": progress}
         bridge = BackgroundTaskUiBridge(
@@ -4759,6 +5355,15 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         if dialog is None or self.node_ids is None or self.current_field not in self.fields:
             return
         settings = dialog.settings()
+        try:
+            node_indices = dialog.instance_scope.node_indices(len(self.node_ids))
+        except ValueError as exc:
+            self._remove_extreme_actors()
+            dialog.set_results([], str(exc))
+            self.safe_render_both()
+            return
+        instance_mask = np.zeros(len(self.node_ids), dtype=bool)
+        instance_mask[node_indices] = True
         requested_source = settings["source"]
         extreme_type = settings["extreme_type"]
         count = settings["count"]
@@ -4802,7 +5407,7 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         rows = []
         coordinates = _coords_3d(self.coords)
         for model_name, side, field_name, values in sources:
-            valid_mask = np.isfinite(values)
+            valid_mask = np.isfinite(values) & instance_mask
             if settings["scope"] == "visible" and self.assembly_display.active:
                 valid_mask &= self.assembly_display.source_show_mask()
             if visible_threshold is not None:
@@ -4815,6 +5420,9 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
                 rows.append(
                     {
                         "model": model_name,
+                        "instance_name": self.assembly_display.objects[
+                            int(self.assembly_display.node_owners[int(source_index)])]["name"]
+                            if self.assembly_display.node_owners[int(source_index)] >= 0 else "--",
                         "type_label": type_labels[extreme_type],
                         "node_id": int(self.node_ids[int(source_index)]),
                         "value": float(values[int(source_index)]),
@@ -4830,6 +5438,7 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
 
         self._remove_extreme_actors()
         context_parts = [f"全阶模型：{self.current_field}", f"帧：{left_frame + 1}"]
+        context_parts.append(dialog.instance_scope.description())
         if right_values is not None:
             right_status_label = "降阶模型" if right_model_label == "ROM" else right_model_label
             context_parts.insert(1, f"{right_status_label}：{right_field_name}")
@@ -5898,8 +6507,12 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         self.rom_current_field = ""
         self.error_current_field = ""
         self.current_frame = 0
+        for analysis_dialog in (self.global_consistency_dialog, self.extreme_query_dialog,
+                                self.temporal_consistency_dialog):
+            if analysis_dialog is not None:
+                analysis_dialog.instance_scope.reset()
+        self._refresh_analysis_field_choices()
         if self.temporal_consistency_dialog is not None:
-            self.temporal_consistency_dialog.refresh_fields()
             self.temporal_consistency_dialog.clear_results()
         if self.node_query_dialog is not None:
             self.node_query_dialog.clear_result()
@@ -6153,10 +6766,12 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
                 combo.setCurrentText(loaded_names[0])
             elif side == "right" and self.rom_current_field == "" and loaded_names:
                 combo.setCurrentText(loaded_names[0])
-            if self.local_consistency_dialog is not None:
-                self.local_consistency_dialog.refresh_fields()
+            self._refresh_analysis_field_choices()
+            if loaded_names and self.global_consistency_dialog is not None:
+                self.global_consistency_dialog.result_table.setRowCount(0)
+                self.global_consistency_dialog.summary_label.setText(
+                    "物理场已更新，请重新点击“分析”。")
             if self.temporal_consistency_dialog is not None:
-                self.temporal_consistency_dialog.refresh_fields()
                 self.temporal_consistency_dialog.clear_results()
 
             if cancelled:

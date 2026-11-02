@@ -2191,6 +2191,7 @@ def make_wireframe_actor(grid):
     prop.SetColor(0.32, 0.34, 0.38)
     prop.SetOpacity(0.28)
     prop.SetLineWidth(0.6)
+    prop.LightingOff()
     actor.SetVisibility(False)
     return mapper, actor
 
@@ -4702,7 +4703,13 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
             base_luminance = self._relative_luminance(self._mesh_surface_color_for_grid_mode())
         else:
             base_luminance = float(np.median(luminance))
-        return (0.96, 0.96, 0.96) if base_luminance < 0.45 else (0.05, 0.05, 0.05)
+        # 不使用黑/白二选一：逐帧跨过阈值会导致整幅网格突然闪白。
+        # 深色云图使用低覆盖的浅灰线，亮色云图使用深灰线，连续过渡。
+        blend = float(np.clip((base_luminance - 0.18) / 0.47, 0.0, 1.0))
+        blend = blend * blend * (3.0 - 2.0 * blend)
+        light = np.array((0.62, 0.65, 0.69))
+        dark = np.array((0.08, 0.09, 0.11))
+        return tuple(light * (1.0 - blend) + dark * blend)
 
     def _set_wire_and_outline_color(self, color):
         for actor in (
@@ -4725,17 +4732,32 @@ class VTKCompareWindow(QtWidgets.QMainWindow):
         left_range=None,
         right_range=None,
     ):
-        samples = []
-        if left_values is not None and left_lut is not None and left_range is not None:
-            samples.append(self._lut_luminance_for_values(left_values, left_lut, left_range))
-        if right_values is not None and right_lut is not None and right_range is not None:
-            samples.append(self._lut_luminance_for_values(right_values, right_lut, right_range))
-        non_empty_samples = [sample for sample in samples if sample.size]
-        if non_empty_samples:
-            luminance = np.concatenate(non_empty_samples)
-        else:
-            luminance = np.array([], dtype=float)
-        self._set_wire_and_outline_color(self._auto_wire_color_from_luminance(luminance))
+        for side, values, lut, scalar_range in (
+            ("l", left_values, left_lut, left_range),
+            ("r", right_values, right_lut, right_range),
+        ):
+            if values is None or lut is None or scalar_range is None:
+                # 网格/背景设置也会调用本方法；有云图时不能退回模型纯色。
+                mapper = getattr(self, "mapper_" + side, None)
+                grid = getattr(self, "grid_" + side, None)
+                scalars = grid.GetPointData().GetScalars() if grid is not None else None
+                if mapper is not None and mapper.GetScalarVisibility() and scalars is not None:
+                    values = vtk_to_numpy(scalars)
+                    lut, scalar_range = mapper.GetLookupTable(), mapper.GetScalarRange()
+            luminance = (self._lut_luminance_for_values(values, lut, scalar_range)
+                         if scalar_range is not None else np.array([], dtype=float))
+            color = self._auto_wire_color_from_luminance(luminance)
+            wire = getattr(self, "wire_actor_" + side, None)
+            if wire is not None:
+                prop = wire.GetProperty()
+                prop.SetColor(*color)
+                # 密网格的浅色线叠加容易洗白整个实体，限制其覆盖强度。
+                prop.SetOpacity(0.18 if self._relative_luminance(color) > 0.4 else 0.28)
+                prop.LightingOff()
+            outline = getattr(self, "outline_actor_" + side, None)
+            if outline is not None:
+                outline.GetProperty().SetColor(*color)
+                outline.GetProperty().LightingOff()
 
     def _apply_grid_display_mode(self):
         self._ensure_wireframe_ready()

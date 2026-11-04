@@ -1,10 +1,16 @@
-# Project structure
+# 项目结构
 
-- Keep user-facing Python GUI entry points in the project root.
-- Put Python scripts called by those entry points in `script/`.
-- ODB Exporter has two scripts: `odb_exporter.py` for the GUI and
-  `script/odb_export_backend.py` for ODB inspection, upgrading, node ordering,
-  CSV export and the GUI event protocol. Keep its backend self-contained.
-- The GUI runs in ordinary Python; the backend runs in Abaqus Python and must
-  remain compatible with Python 2 and Python 3. Keep Abaqus imports lazy so the
-  backend can be imported for checks without an Abaqus installation.
+- 面向用户的 Python 图形界面入口文件放在项目根目录。
+- 由这些入口调用的 Python 脚本放在 `script/` 目录。
+- ODB Exporter 由两个脚本组成：`odb_exporter.py` 负责图形界面；
+  `script/odb_export_backend.py` 负责 ODB 检查、升级、节点排序、CSV 导出
+  以及与图形界面通信的事件协议。后端应保持自包含。
+- 图形界面运行于普通 Python 环境；后端运行于 Abaqus Python 环境，
+  必须同时兼容 Python 2 和 Python 3。Abaqus 模块应按需延迟导入，
+  确保未安装 Abaqus 时也能导入后端模块进行检查。
+
+# 语言要求
+
+- 后续与用户的沟通、工作进展说明和最终回复均使用简体中文，除非用户明确要求其他语言。
+- 本文件及后续新增或修改的项目说明文档、代码注释和面向用户的提示文本均使用简体中文。
+- 代码标识符、文件名、命令、API 名称和必要的专业术语保留原文；引用外部原文时可保留其原始语言。
